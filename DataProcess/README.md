@@ -6,6 +6,7 @@ and collecting additional trajectories with DAgger.
 | Tool | Purpose |
 |---|---|
 | [convert_vln.py](tool/convert_vln.py) | Convert R2R, RxR, and ScaleVLN trajectories into training annotations |
+| [prepare_sft.py](tool/prepare_sft.py) | Prepare all three extracted SFT datasets, including ms-swift JSONL files |
 | [convert_dagger.py](tool/convert_dagger.py) | Convert collected DAgger trajectories using executed actions |
 | [dagger_simplevln.sh](scripts/dagger_simplevln.sh) | Collect R2R or RxR trajectories with Habitat and a vLLM server |
 | [trajectory_making.py](tool/trajectory_making.py) | Replay EnvDrop or ScaleVLN trajectories to export camera poses and intrinsics |
@@ -66,6 +67,32 @@ images outside that root.
 Distribute the annotations and image directories under the same root, and
 configure the training loader to resolve paths from it. Without `--relative_to`,
 the converter preserves paths derived from `--image_root`.
+
+### Prepare the Released SFT Dataset
+
+After extracting the SFT release into the layout shown in the root README, run:
+
+```bash
+python tool/prepare_sft.py \
+    --data_root /path/to/SFT \
+    --output_root /path/to/prepared \
+    --seed 0 --max_history 8
+```
+
+The tool reuses the VLN converter above and writes only
+`ms_swift/{R2R,RxR,ScaleVLN}.jsonl`, one trajectory at a time. The files use
+standard `messages[role/content]` and absolute image paths, retaining the original
+system prompt, navigation instructions, action labels, and visual history.
+Basic checks reject invalid trajectories, missing or empty images, and mismatched
+image placeholders. Each file is replaced only after conversion succeeds.
+Rerunning the command regenerates the selected datasets. This CPU-only step
+requires `requirements-convert.txt`.
+
+In this checkout the physical data root is
+`../data/SimpleVLN_SFT_Data/extracted/SFT`, and prepared annotations are under
+`../data/SimpleVLN_SFT_Data/processed`. Load the local model and data paths from
+the repository root with `source data/paths.env`. These paths use directories
+inside the checkout, without symbolic links.
 
 ## Trajectory Collection
 
