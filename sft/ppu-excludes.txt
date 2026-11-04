@@ -1,0 +1,9 @@
+# Do not resolve or install public CUDA builds over the image's PPU builds.
+torch
+torchvision
+torchaudio
+triton
+transformers
+accelerate
+deepspeed
+flash-attn

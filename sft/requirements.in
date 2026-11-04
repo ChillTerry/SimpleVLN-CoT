@@ -1,0 +1,20 @@
+# SFT overlay for the PPU Python 3.12 / torch 2.8 image.
+# Vendor packages are inherited; see ppu-excludes.txt.
+ms-swift==3.10.3
+qwen-vl-utils==0.0.14
+trl==0.24.0
+datasets==3.1.0
+peft==0.16.0
+numpy==1.26.4
+huggingface-hub==0.36.0
+tokenizers==0.22.1
+safetensors==0.6.2
+gradio==5.49.1
+modelscope==1.31.0
+openai==2.8.1
+pandas==2.3.3
+pyarrow==22.0.0
+einops==0.8.1
+packaging==25.0
+scipy==1.16.3
+setuptools==79.0.1
