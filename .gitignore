@@ -1,0 +1,9 @@
+# Local dataset archives, extracted frames, prepared annotations and model weights.
+/data/
+/models/
+
+# SFT virtual environment, local compiler caches, and training artifacts.
+/.venv-sft/
+/outputs/
+__pycache__/
+*.pyc
