@@ -75,7 +75,8 @@ command=(
     --strict true --seed 42 --data_seed 42
     --loss_scale default --acc_strategy token --average_tokens_across_devices true
     --ddp_find_unused_parameters false --padding_free false --use_logits_to_keep true
-    --logging_steps 10 --logging_nan_inf_filter false --report_to none
+    --logging_steps 10 --logging_nan_inf_filter false
+    --report_to tensorboard --logging_dir "$OUTPUT_DIR/runs"
     --save_strategy steps --save_steps 1000 --save_total_limit 2 --save_only_model false
     --output_dir "$OUTPUT_DIR" --add_version false
     --deepspeed "$SFT_DIR/zero1.json" --dataloader_prefetch_factor 2
