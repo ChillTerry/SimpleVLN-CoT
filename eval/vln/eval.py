@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+from copy import deepcopy
 from io import BytesIO
 import json
 import multiprocessing as mp
@@ -411,6 +412,10 @@ def main():
     parser.add_argument("--forward-distance",type=int,help="distance that one forward action takes",default=25)
     parser.add_argument("--turn-angle",type=int,help="angle that one turn action takes",default=15)
     parser.add_argument("--max-action-history",type=int,help="the maximum num of action history",default=10)
+    parser.add_argument("--max-episodes", type=int, default=None,
+                        help="evaluate only the first N episodes (use a separate result directory)")
+    parser.add_argument("--sim-gpu-ids", default=None,
+                        help="comma-separated simulator GPU indices within CUDA_VISIBLE_DEVICES; workers cycle through them")
     # Accept the former no-op flag for existing launch commands; repetitions use pass-k.
     parser.add_argument("--num-generations",type=int,choices=(1,),help=argparse.SUPPRESS)
     parser.add_argument("--pass-k", type=int, default=1, help="run each trajectory k times")
@@ -430,6 +435,20 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.sim_gpu_ids is not None:
+        try:
+            args.sim_gpu_ids = [int(value) for value in args.sim_gpu_ids.split(",")]
+        except ValueError:
+            parser.error("--sim-gpu-ids must contain comma-separated nonnegative integers")
+        if (not args.sim_gpu_ids or min(args.sim_gpu_ids) < 0
+                or len(set(args.sim_gpu_ids)) != len(args.sim_gpu_ids)):
+            parser.error("--sim-gpu-ids must contain distinct nonnegative integers")
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if visible is not None and (not visible or visible == "-1"
+                or max(args.sim_gpu_ids) >= len(visible.split(","))):
+            parser.error("--sim-gpu-ids must index the devices in CUDA_VISIBLE_DEVICES")
+    if args.max_episodes is not None and args.max_episodes <= 0:
+        parser.error("--max-episodes must be positive")
     try:
         vllm_base_url = resolve_vllm_urls(args)
     except ValueError as exc:
@@ -476,6 +495,8 @@ def run_evaluation(args, vllm_base_url):
             
     dataset = habitat.datasets.make_dataset(id_dataset=config.habitat.dataset.type, config=config.habitat.dataset)
     dataset.config = config.habitat.dataset
+    if getattr(args, "max_episodes", None) is not None:
+        dataset.episodes = dataset.episodes[:args.max_episodes]
     num_episodes = len(dataset.episodes)
     if not num_episodes:
         raise ValueError("The configured dataset contains no episodes")
@@ -499,11 +520,17 @@ def run_evaluation(args, vllm_base_url):
     processes = []
     try:
         for i in range(split_num):
+            worker_config = config
+            sim_gpu_ids = getattr(args, "sim_gpu_ids", None)
+            if sim_gpu_ids:
+                worker_config = deepcopy(config)
+                with habitat.config.read_write(worker_config):
+                    worker_config.habitat.simulator.habitat_sim_v0.gpu_device_id = sim_gpu_ids[i % len(sim_gpu_ids)]
             worker_args = (
                 result_queue,
                 vllm_base_url,
                 args.vllm_model_name,
-                config,
+                worker_config,
                 dataset_splits[i],
                 args.result_path,
                 args.forward_distance,
