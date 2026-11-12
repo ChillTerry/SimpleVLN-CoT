@@ -32,9 +32,17 @@ run_one() {
     if [[ -n "${VLLM_BASE_URL:-}" ]]; then
         server_args=(--vllm_base_url "${VLLM_BASE_URL}")
     fi
+    local eval_args=()
+    if [[ -n "${SIM_GPU_IDS:-}" ]]; then
+        eval_args+=(--sim-gpu-ids "$SIM_GPU_IDS")
+    fi
+    if [[ -n "${MAX_EPISODES:-}" ]]; then
+        eval_args+=(--max-episodes "$MAX_EPISODES")
+    fi
     "${PYTHON}" vln/eval.py \
         --exp-config "${cfg}" \
         "${server_args[@]}" \
+        "${eval_args[@]}" \
         --vllm_model_name "${VLLM_MODEL_NAME}" \
         --split-num "${SPLIT_NUM}" \
         --pass-k "${PASS_K}" \

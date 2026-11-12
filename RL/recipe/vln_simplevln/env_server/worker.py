@@ -78,7 +78,8 @@ def materialize_dataset_json(data_path: str, dest_dir: str) -> str:
         raise ValueError(f"No episodes in {path}")
     out = os.path.join(dest_dir, "vln_train.json.gz")
     with gzip.open(out, "wt", encoding="utf-8") as stream:
-        json.dump({"episodes": episodes}, stream)
+        # Required by Habitat 0.3.3's R2RVLN-v1 loader.
+        json.dump({"instruction_vocab": {"word_list": []}, "episodes": episodes}, stream)
     return out
 
 
@@ -103,6 +104,11 @@ def _select_episode(matches, instruction):
             return exact[0]
         if len(exact) > 1:
             return None
+        # Released manifests strip whitespace retained in some Habitat episodes.
+        normalized = [episode for episode in matches
+                      if _episode_instruction(episode).strip() == instruction.strip()]
+        if normalized:
+            return normalized[0] if len(normalized) == 1 else None
     return matches[0] if len(matches) == 1 else None
 
 

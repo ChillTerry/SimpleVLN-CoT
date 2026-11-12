@@ -4,7 +4,7 @@
 # --vllm_num_servers <N>.
 #
 # Usage:
-#   MODEL_PATH=/path/to/hf-ckpt bash serve_vllm.sh [NUM_GPUS] [TP_SIZE]
+#   MODEL_PATH=/path/to/hf-ckpt bash serve_vllm.sh [NUM_GPUS] [TP_SIZE] [vLLM options...]
 #   NUM_GPUS default 8, TP_SIZE default 1  →  8 servers on 22001..22008
 #   NUM_GPUS=8 TP_SIZE=2                    →  4 servers, each on 2 GPUs
 #
@@ -32,6 +32,8 @@ else
     NUM_GPUS=${1:-${NUM_GPUS:-8}}
 fi
 TP_SIZE=${2:-${TP_SIZE:-1}}
+EXTRA_ARGS=("${@:3}")
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.8}"
 
 if ! [[ "$NUM_GPUS" =~ ^[1-9][0-9]*$ && "$TP_SIZE" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: NUM_GPUS and TP_SIZE must be positive integers"
@@ -68,6 +70,7 @@ fi
 import socket, sys
 for port in range(int(sys.argv[1]), int(sys.argv[1]) + int(sys.argv[2])):
     with socket.socket() as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind(("0.0.0.0", port))
         except OSError as exc:
@@ -93,12 +96,13 @@ for i in $(seq 0 $((NUM_SERVERS - 1))); do
     nohup vllm serve "$MODEL_PATH" \
         --served-model-name "$MODEL_NAME" \
         --tensor-parallel-size "$TP_SIZE" \
-        --gpu-memory-utilization 0.8 \
+        --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
         --mm-encoder-tp-mode data \
         --async-scheduling \
         --enable-prefix-caching \
         --host 0.0.0.0 \
         --port "$PORT" \
+        "${EXTRA_ARGS[@]}" \
         > "$LOG_FILE" 2>&1 &
 
     PID=$!
