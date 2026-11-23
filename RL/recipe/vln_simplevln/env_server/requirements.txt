@@ -1,4 +1,4 @@
-# Install Habitat Sim 0.3.3 first, in a separate Python 3.10 environment.
+# Install Habitat-Sim 0.3.3 first. The official Linux headless build uses Python 3.9.
 habitat-lab @ git+https://github.com/facebookresearch/habitat-lab.git@v0.3.3#subdirectory=habitat-lab
 numpy<2
 Pillow

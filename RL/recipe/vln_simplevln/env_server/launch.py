@@ -8,8 +8,8 @@ Example:
       --config recipe/vln_simplevln/config/vln_datasets.yaml \\
       --port 8002 --pool-size 8 --gpu-ids 0,1,2,3,4,5,6,7
 
-Each worker owns one GPU (CUDA_VISIBLE_DEVICES); if ``--gpu-ids`` has fewer
-entries than ``--pool-size`` they cycle round-robin.
+Each worker runs one Habitat process. When GPU IDs are supplied, they cycle
+through the worker pool. Use ``--cpu`` to run the recipe with Mesa llvmpipe.
 """
 from __future__ import annotations
 
@@ -36,13 +36,23 @@ def main():
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8002)
     p.add_argument("--pool-size", type=int, default=1,
-                   help="Number of parallel habitat workers (one process per GPU).")
+                   help="Number of Habitat worker processes. Each serves one active episode.")
     p.add_argument("--session-ttl-sec", type=float, default=1800.0)
-    p.add_argument("--gpu-ids", type=str, default=None,
-                   help="Comma-separated GPU IDs, one per worker (e.g. 0,1,2,3,4,5,6,7).")
+    renderer = p.add_mutually_exclusive_group()
+    renderer.add_argument("--cpu", action="store_true",
+                          help="Use Mesa llvmpipe for CPU rendering with the VLN Habitat config.")
+    renderer.add_argument("--gpu-ids", type=str,
+                          help="Comma-separated GPU IDs assigned round-robin to workers (e.g. 0,1).")
     args = p.parse_args()
 
     gpu_ids = [int(g) for g in args.gpu_ids.split(",")] if args.gpu_ids else None
+    if args.cpu:
+        os.environ.update({
+            "VLN_SIM_GPU_DEVICE_ID": "-1",
+            "LIBGL_ALWAYS_SOFTWARE": "1",
+            "GALLIUM_DRIVER": "llvmpipe",
+            "CUDA_VISIBLE_DEVICES": "",
+        })
 
     set_config(args.config, pool_size=args.pool_size,
                session_ttl_sec=args.session_ttl_sec, gpu_ids=gpu_ids)

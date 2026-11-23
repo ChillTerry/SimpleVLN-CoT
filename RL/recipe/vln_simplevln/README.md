@@ -5,7 +5,7 @@ rollout produces a sequence of navigation decisions and a terminal success rewar
 DAPO filters episode groups with identical rewards and samples additional groups
 until the training batch has enough useful groups.
 
-Commands below use paths relative to the RL repository root.
+Run the commands below from the `RL/` directory.
 
 ## Installation
 
@@ -23,13 +23,16 @@ uv pip install -e .
 uv pip install -r recipe/vln_simplevln/requirements.txt
 ```
 
-For Habitat, use Python 3.10 and install Habitat Sim before Habitat Lab:
+For Habitat on Linux x86-64, use the official Habitat-Sim 0.3.3 headless build
+in a separate Python 3.9 environment. The service runs from the `RL/` checkout.
+[Habitat-Sim packages](https://anaconda.org/aihabitat/habitat-sim/files?version=0.3.3)
 
 ```bash
-conda create -n simplevln-habitat python=3.10 -y
+conda create -y -n simplevln-habitat --override-channels -c conda-forge -c aihabitat \
+  python=3.9 numpy=1.26.4 'habitat-sim=0.3.3=py3.9_headless_linux_*'
 conda activate simplevln-habitat
-conda install habitat-sim=0.3.3 headless -c conda-forge -c aihabitat
-python -m pip install -r recipe/vln_simplevln/env_server/requirements.txt
+uv pip install --python "$CONDA_PREFIX/bin/python" \
+  -r recipe/vln_simplevln/env_server/requirements.txt 'opencv-python<4.12'
 ```
 
 The environment service includes the oracle navigation measurements it uses.
@@ -84,6 +87,48 @@ availability at `http://localhost:8002/stats`.
 The default rollout endpoint is `http://127.0.0.1:8002`, local to each Ray worker.
 For a shared remote service, set `VLN_ENV_SERVER_URL=http://ENV_HOST:8002` when
 launching training. The launcher forwards this setting to the Ray actors.
+
+### CPU rendering on a PPU node
+
+Habitat renders on the host CPU with Mesa llvmpipe. On Ubuntu 24.04, install
+`libegl1`, `libegl-mesa0`, `libgl1-mesa-dri`, `libgl1`, and `libglib2.0-0t64`
+for Mesa and OpenCV. Start the service on loopback after setting
+`VLN_RL_DATA_ROOT` and `VLN_SCENE_ROOT` in the Habitat environment.
+
+```bash
+LP_NUM_THREADS=2 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+python -m recipe.vln_simplevln.env_server.launch \
+  --config recipe/vln_simplevln/config/vln_datasets.yaml \
+  --cpu --host 127.0.0.1 --port 8002 --pool-size 8
+```
+
+`--cpu` selects llvmpipe and sets `VLN_SIM_GPU_DEVICE_ID=-1` for the recipe's
+RGB-only Habitat config. With a custom Habitat config, set
+`habitat.simulator.habitat_sim_v0.gpu_device_id` to `-1` and `gpu_gpu` to `false`.
+Confirm that the startup log shows `Renderer: llvmpipe` and that
+`curl -fsS http://127.0.0.1:8002/stats` reports the workers ready.
+
+Run the trainer from the separate PPU environment. Use vendor PyTorch and a PPU
+vLLM build compatible with Qwen3-VL and veRL. The Alibaba Cloud 25.11 PPU image
+with vLLM 0.10.2 requires the documented vendor upgrade for Qwen3-VL.
+[Alibaba Cloud PPU release notes](https://help.aliyun.com/zh/document_detail/2998453.html)
+
+For a four-device Qwen3-VL-4B run, substitute the device IDs allocated to the job.
+Set `TRAIN_FILE` to the training Parquet loaded by the service.
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+ray start --head --num-gpus=4
+
+MODEL_PATH=/path/to/qwen3-vl-4b-sft-checkpoint \
+TRAIN_FILE=/path/to/release_rl_data/manifests/vln_train.parquet \
+VLN_ENV_SERVER_URL=http://127.0.0.1:8002 \
+NUM_WORKERS=8 ROLLOUT_WINDOW=8 USE_REMOVE_PADDING=False \
+bash recipe/vln_simplevln/run_dapo_1node_4gpu_qwen3vl_4b.sh
+```
+
+One active rollout occupies one Habitat worker. Set `ROLLOUT_WINDOW` no larger
+than the service's `--pool-size` to avoid retries for a free worker.
 
 ## Training
 

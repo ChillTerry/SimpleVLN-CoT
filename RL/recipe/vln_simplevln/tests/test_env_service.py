@@ -1,5 +1,7 @@
 import asyncio
+import os
 import queue
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -10,9 +12,67 @@ from pydantic import ValidationError
 from fastapi import HTTPException
 import pytest
 
-from recipe.vln_simplevln.env_server import server, worker
+from recipe.vln_simplevln.env_server import launch, server, worker
 from recipe.vln_simplevln.env_server.schemas import StepRequest
 from recipe.vln_simplevln.rollout_smoke import episode_request
+
+
+@pytest.mark.parametrize(('options', 'gpu_ids'), [
+    (['--cpu'], None),
+    (['--gpu-ids', '0,2'], [0, 2]),
+    ([], None),
+])
+def test_env_server_launcher_configures_renderer(monkeypatch, options, gpu_ids):
+    inherited_env = {
+        'VLN_SIM_GPU_DEVICE_ID': '2',
+        'LIBGL_ALWAYS_SOFTWARE': '0',
+        'GALLIUM_DRIVER': 'softpipe',
+        'CUDA_VISIBLE_DEVICES': '4,5',
+    }
+    for variable, value in inherited_env.items():
+        monkeypatch.setenv(variable, value)
+
+    expected_env = inherited_env
+    if '--cpu' in options:
+        expected_env = {
+            'VLN_SIM_GPU_DEVICE_ID': '-1',
+            'LIBGL_ALWAYS_SOFTWARE': '1',
+            'GALLIUM_DRIVER': 'llvmpipe',
+            'CUDA_VISIBLE_DEVICES': '',
+        }
+
+    def start_server(*args, **kwargs):
+        assert {variable: os.environ.get(variable) for variable in expected_env} == expected_env
+
+    set_config = Mock()
+    serve = Mock(side_effect=start_server)
+    monkeypatch.setattr(launch, 'set_config', set_config)
+    monkeypatch.setattr(launch.uvicorn, 'run', serve)
+    monkeypatch.setattr(sys, 'argv', [
+        'launch', '--config', 'config.yaml', '--pool-size', '2',
+        '--host', '127.0.0.1', '--port', '0', *options,
+    ])
+
+    launch.main()
+
+    set_config.assert_called_once_with('config.yaml', pool_size=2, session_ttl_sec=1800.0, gpu_ids=gpu_ids)
+    serve.assert_called_once_with(launch.app, host='127.0.0.1', port=0, log_level='info')
+
+
+def test_env_server_launcher_rejects_cpu_with_gpu_ids(monkeypatch, capsys):
+    set_config = Mock()
+    serve = Mock()
+    monkeypatch.setattr(launch, 'set_config', set_config)
+    monkeypatch.setattr(launch.uvicorn, 'run', serve)
+    monkeypatch.setattr(sys, 'argv', ['launch', '--config', 'config.yaml', '--cpu', '--gpu-ids', '0'])
+
+    with pytest.raises(SystemExit) as error:
+        launch.main()
+
+    assert error.value.code == 2
+    assert 'argument --gpu-ids: not allowed with argument --cpu' in capsys.readouterr().err
+    set_config.assert_not_called()
+    serve.assert_not_called()
 
 
 def test_shared_scene_episode_uses_instruction_and_reports_executed_actions(monkeypatch):

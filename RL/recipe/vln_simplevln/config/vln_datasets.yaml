@@ -7,11 +7,8 @@
 defaults:
   - /habitat: habitat_config_base
   - /habitat/task: vln_r2r
-  - /habitat/simulator/sensor_setups@habitat.simulator.agents.main_agent: rgbd_agent
+  - /habitat/simulator/sensor_setups@habitat.simulator.agents.main_agent: rgb_agent
   - /habitat/dataset/vln: mp3d_r2r
-  - /habitat/task/lab_sensors:
-    - gps_sensor
-    - compass_sensor
   - /habitat/task/measurements/oracle_success@habitat.task.measurements.oracle_success
   - _self_
 
@@ -29,17 +26,13 @@ habitat:
             width: 640
             height: 480
             hfov: 90
-          depth_sensor:
-            width: 640
-            height: 480
-            hfov: 90
-            min_depth: 0.0
-            max_depth: 10.0
     forward_step_size: 0.25
     turn_angle: 15
     requires_textures: true
     habitat_sim_v0:
-      gpu_device_id: 0
+      # Use -1 to let EGL select a renderer without a CUDA device ID.
+      gpu_device_id: ${oc.decode:${oc.env:VLN_SIM_GPU_DEVICE_ID,0}}
+      gpu_gpu: false
   task:
     measurements:
       distance_to_goal:
