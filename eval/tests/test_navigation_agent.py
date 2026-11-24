@@ -6,6 +6,7 @@ import base64
 from contextlib import nullcontext, redirect_stderr
 from copy import deepcopy
 from io import BytesIO, StringIO
+from itertools import groupby
 import os
 from pathlib import Path
 import re
@@ -52,21 +53,35 @@ class NavigationTests(unittest.TestCase):
         nodes = [n for n in nodes if not isinstance(n, ast.Assign)
                  or any(isinstance(t, ast.Name) and t.id == 'SYSTEM_PROMPT' for t in n.targets)]
         namespace = dict(Agent=object, OpenAI=client, os=os, re=re, BytesIO=BytesIO,
-                         base64=base64, Image=SimpleNamespace(fromarray=lambda x: x),
+                         base64=base64, groupby=groupby, Image=SimpleNamespace(fromarray=lambda x: x),
                          random=SimpleNamespace(randint=lambda a, b: 3))
         exec(compile(ast.Module(body=nodes, type_ignores=[]), '<navigation>', 'exec'), namespace)
-        self.agent = namespace['SimpleVLN_Agent'](
+        self.agent_class = namespace['SimpleVLN_Agent']
+        self.agent = self.make_agent()
+
+    def make_agent(self, **kwargs):
+        return self.agent_class(
             'http://server-a/v1,http://server-b/v1', 'model', self.folder.name,
-            25, 15, 10, 1.0)
+            25, 15, 10, 1.0, **kwargs)
 
     def act(self, frame):
-        return self.agent.act({'rgb': Frame(frame), 'instruction': {'text': 'Go to the door.'}},
-                              {}, 'episode')['action']
+        result = self.agent.act({'rgb': Frame(frame), 'instruction': {'text': 'Go to the door.'}},
+                                {}, 'episode')
+        if result is None:
+            return None
+        action_id = result['action']
+        if self.agent.policy_format == 'cot':
+            self.agent.record_action(action_id)
+        return action_id
 
     def image_labels(self, request):
         content = request['messages'][1]['content']
         return [base64.b64decode(item['image_url']['url'].split(',', 1)[1]).decode()
                 for item in content if item['type'] == 'image_url']
+
+    def latest_prompt(self):
+        content = self.requests[-1][1]['messages'][1]['content']
+        return ''.join(item.get('text', '<image>') for item in content)
 
     def test_prompt_images_sampling_and_request_parameters(self):
         for i in range(12):
@@ -135,6 +150,70 @@ class NavigationTests(unittest.TestCase):
                 self.assertEqual(self.agent.extract_result(text), expected)
         self.output = 'unrecognized'
         self.assertEqual(self.act(0), 3)
+
+    def test_cot_prompt_carries_raw_memory_and_executed_commands(self):
+        self.agent = self.make_agent(policy_format='cot')
+        plan = '\nStop, turn left 45 degree.\n'
+        self.output = f'<plan>{plan}</plan>\n<actions>forward 50 cm, forward 25 cm, stop</actions>'
+        self.assertEqual([self.act(i) for i in range(3)], [1, 1, 1])
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.requests[0][1]['max_completion_tokens'], 1024)
+        self.assertTrue(self.latest_prompt().startswith(
+            'History: <image>\nCurrent: <image>\n\nInstruction:\nGo to the door.'))
+        self.assertIn('Return <plan> as an ordered YAML list', self.latest_prompt())
+
+        state = '\nNot JSON. Stop, or look left.\n'
+        self.output = f'<state>{state}</state><actions>forward 36 cm, unrecognized, stop</actions>'
+        self.assertEqual([self.act(i) for i in (3, 4)], [1, 3])
+        self.assertIn('Instruction:\n' + plan, self.latest_prompt())
+        self.assertIn('Executed actions:\nforward 50 cm, forward 25 cm\n\n', self.latest_prompt())
+        self.assertNotIn('Previous assessment', self.latest_prompt())
+
+        self.output = '<actions></actions>'
+        self.assertEqual(self.act(5), 3)
+        self.assertIn('Executed actions:\nforward 50 cm, forward 25 cm\nforward 25 cm, turn right 15 degree',
+                      self.latest_prompt())
+        self.assertIn('Previous assessment (revise with current evidence):\n' + state, self.latest_prompt())
+        self.output = '<actions>stop</actions>'
+        self.assertEqual(self.act(6), 0)
+        self.assertIn('Previous assessment (revise with current evidence):\n' + state, self.latest_prompt())
+
+        self.agent.reset()
+        self.output = '<plan></plan><actions>stop</actions>'
+        self.assertEqual(self.act(7), 0)
+        self.assertEqual(self.image_labels(self.requests[-1][1]), ['7', '7'])
+        self.assertIn('Instruction:\nGo to the door.', self.latest_prompt())
+        self.assertNotIn('Previous assessment', self.latest_prompt())
+        self.assertNotIn('Executed actions', self.latest_prompt())
+
+    def test_cot_requires_closed_blocks_and_accepts_empty_plan_text(self):
+        self.agent = self.make_agent(policy_format='cot', max_completion_tokens=200)
+        for response in ('<actions>stop</actions>', '<plan>unclosed<actions>stop</actions>',
+                         '<plan>goal</plan><actions>stop', None):
+            with self.subTest(response=response):
+                self.agent.reset()
+                self.output = response
+                requests_before = len(self.requests)
+                self.assertIsNone(self.act(0))
+                self.assertEqual(len(self.requests), requests_before + 1)
+                self.assertEqual(self.requests[-1][1]['max_completion_tokens'], 200)
+
+        self.output = '<plan></plan><actions>forward 25 cm</actions>'
+        self.assertEqual(self.act(0), 1)
+        self.output = '<actions>forward 25 cm</actions>'
+        self.assertEqual(self.act(1), 1)
+        self.output = '<state>no actions</state>'
+        self.assertIsNone(self.act(2))
+
+    def test_cot_samples_full_observed_episode_history(self):
+        self.agent = self.make_agent(policy_format='cot')
+        self.output = '<plan>goal</plan><actions>forward 25 cm</actions>'
+        self.assertEqual(self.act(0), 1)
+        self.output = '<actions>forward 25 cm</actions>'
+        for frame in range(1, 13):
+            self.assertEqual(self.act(frame), 1)
+        self.assertEqual(self.image_labels(self.requests[-1][1]),
+                         ['0', '2', '3', '5', '6', '8', '9', '11', '12'])
 
 
 class CommandLineTests(unittest.TestCase):

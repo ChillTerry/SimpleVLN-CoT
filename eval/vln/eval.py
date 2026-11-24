@@ -4,6 +4,7 @@ import argparse
 import base64
 from copy import deepcopy
 from io import BytesIO
+from itertools import groupby
 import json
 import multiprocessing as mp
 import os
@@ -47,7 +48,8 @@ def seed_all():
 
 def evaluate_agent(result_queue, base_url, model_name, config, dataset, result_path,
                     forward_distance, turn_angle, max_action_history, resolution_ratio,
-                    save_video, pass_k, done_rows) -> None:
+                    save_video, pass_k, done_rows, policy_format="legacy",
+                    max_completion_tokens=None) -> None:
 
     env = Env(config.habitat, dataset)
 
@@ -60,7 +62,10 @@ def evaluate_agent(result_queue, base_url, model_name, config, dataset, result_p
             turn_angle,
             max_action_history,
             resolution_ratio,
-            save_video=save_video)
+            save_video=save_video,
+            policy_format=policy_format,
+            max_completion_tokens=max_completion_tokens,
+        )
 
         episodes_snapshot = list(env.episodes)
         
@@ -90,6 +95,7 @@ def evaluate_agent(result_queue, base_url, model_name, config, dataset, result_p
                 t_dict = {"t_episode": 0}
                 continuse_rotation_count = 0
                 last_dtg = 999
+                missing_required_block = False
                 while not env.episode_over:
                     info = env.get_metrics()
 
@@ -100,12 +106,17 @@ def evaluate_agent(result_queue, base_url, model_name, config, dataset, result_p
                         continuse_rotation_count +=1
 
                     action = agent.act(obs, info, env.current_episode.episode_id)
+                    if action is None:
+                        missing_required_block = True
+                        break
 
                     if continuse_rotation_count > EARLY_STOP_ROTATION or iter_step>EARLY_STOP_STEPS:
                         action = {"action": 0}
 
-                    iter_step+=1
                     obs = env.step(action)
+                    iter_step += 1
+                    if policy_format == "cot":
+                        agent.record_action(action["action"])
 
                 info = env.get_metrics()
                 result = {
@@ -113,8 +124,8 @@ def evaluate_agent(result_queue, base_url, model_name, config, dataset, result_p
                     "episode_id": int(episode_id) if str(episode_id).isdigit() else episode_id,
                     "trial_id": trial_id,
                     "trial_total": pass_k,
-                    "success": info["success"],
-                    "spl": info["spl"],
+                    "success": 0.0 if missing_required_block else info["success"],
+                    "spl": 0.0 if missing_required_block else info["spl"],
                     "os": info["oracle_success"],
                     "ne": info["distance_to_goal"],
                     "steps": iter_step,
@@ -123,12 +134,12 @@ def evaluate_agent(result_queue, base_url, model_name, config, dataset, result_p
                 if "ndtw" in info:
                     result["ndtw"] = info["ndtw"]
                 if "sdtw" in info:
-                    result["sdtw"] = info["sdtw"]
+                    result["sdtw"] = 0.0 if missing_required_block else info["sdtw"]
                 if "path_length" in info:
                     result["path_length"] = info["path_length"]
                 agent.flush_video()
                 t_dict["t_episode"] = time.time() - episode_start_time
-                t_dict["success"] = float(info["success"])
+                t_dict["success"] = float(result["success"])
                 t_dict["result_row"] = result
                 result_queue.put(t_dict)
     finally:
@@ -138,7 +149,7 @@ def evaluate_agent(result_queue, base_url, model_name, config, dataset, result_p
 class SimpleVLN_Agent(Agent):
     def __init__(self, base_url, model_name, result_path, forward_distance,
                     turn_angle, max_action_history, resolution_ratio,
-                    save_video=False):
+                    save_video=False, policy_format="legacy", max_completion_tokens=None):
 
         self.result_path = result_path
         self.save_video = save_video
@@ -146,6 +157,7 @@ class SimpleVLN_Agent(Agent):
         self.turn_angle = turn_angle
         self.resolution_ratio = resolution_ratio
         self.max_action_history = max_action_history
+        self.policy_format = policy_format
         os.makedirs(self.result_path, exist_ok=True)
         if self.save_video:
             os.makedirs(os.path.join(self.result_path, "video"), exist_ok=True)
@@ -157,7 +169,9 @@ class SimpleVLN_Agent(Agent):
 
         self.temperature = 0.3
         self.top_p = 0.95
-        self.max_tokens = 512
+        if max_completion_tokens is None:
+            max_completion_tokens = 1024 if policy_format == "cot" else 512
+        self.max_tokens = max_completion_tokens
 
         self.promt_template = "Imagine you are a robot programmed for navigation tasks. "\
             "You have been given a video of historical observations and an image of the current observation. "\
@@ -188,6 +202,8 @@ class SimpleVLN_Agent(Agent):
         )
 
         output_text = outputs.choices[0].message.content
+        if output_text is None and self.policy_format == "cot":
+            return ""
         output_text = re.sub(r'<think>.*?</think>', '', output_text, flags=re.DOTALL)
         output_text = output_text.strip()
 
@@ -279,7 +295,99 @@ class SimpleVLN_Agent(Agent):
             return "turn right"
         else:
             raise ValueError(f"Invalid action ID: {action_id}")
-        
+
+    def executed_action_text(self, action_id, repeats):
+        name = self.action_id_to_str(action_id)
+        if action_id == 0:
+            return name
+        if action_id == 1:
+            return f"{name} {repeats * self.forward_distance} cm"
+        return f"{name} {repeats * self.turn_angle} degree"
+
+    def record_action(self, action_id):
+        self.executed_action_chunks[-1].append((self.command_index, action_id))
+
+    def cot_prompt(self, instruction):
+        if self.cot_plan is None:
+            parts = [
+                f"\n\nInstruction:\n{instruction}",
+                "Return <plan> as an ordered YAML list of {id, text} entries with IDs SG_01, SG_02, "
+                "... and exact instruction excerpts, followed by <actions>.",
+            ]
+        else:
+            history = [
+                ", ".join(self.executed_action_text(action_id, len(list(steps)))
+                          for (_, action_id), steps in groupby(chunk))
+                for chunk in self.executed_action_chunks
+            ]
+            parts = [f"\n\nInstruction:\n{self.cot_plan}", "Executed actions:\n" + "\n".join(history)]
+            if self.previous_assessment is not None:
+                parts.append("Previous assessment (revise with current evidence):\n" + self.previous_assessment)
+            parts.append(
+                "When a new assessment is needed, put <state> before <actions>. Use a JSON object with "
+                "exactly four keys named completed_subgoals (list of evidence-supported SG IDs), "
+                "active_subgoal (one unfinished SG ID), decision (execute, recover, or stop), and summary "
+                "(brief English evidence, unresolved requirements, and the next visual check). "
+                "If the commands end in stop, use decision stop."
+            )
+        parts.append(
+            f"In <actions>, give comma-separated commands. Use forward N cm (positive multiples of "
+            f"{self.forward_distance}), turn left N degree or turn right N degree (positive multiples of "
+            f"{self.turn_angle}), or stop (last if used). Return only the requested blocks with closing tags."
+        )
+        return "\n\n".join(parts)
+
+    def user_content(self, instruction):
+        current = self.rgb_list[-1]
+        history = self.uniform_sample_with_ends(self.rgb_list[:-1], 8) if len(self.rgb_list) > 1 else [current]
+        if self.policy_format == "cot":
+            prefix = "History: "
+            current_label = "\nCurrent: "
+            suffix = self.cot_prompt(instruction)
+        else:
+            prefix = ("Imagine you are a robot programmed for navigation tasks. "
+                      "You have been given a video of historical observations")
+            current_label = " and an image of the current observation"
+            suffix = "." + self.promt_template.format(instruction).split("current observation.", 1)[1]
+        return [
+            {"type": "text", "text": prefix},
+            *history,
+            {"type": "text", "text": current_label},
+            current,
+            {"type": "text", "text": suffix},
+        ]
+
+    @staticmethod
+    def tagged_text(response, tag):
+        match = re.search(rf"<{tag}>(.*?)</{tag}>", response, re.DOTALL)
+        return match.group(1) if match else None
+
+    def read_cot_response(self, response):
+        actions = self.tagged_text(response, "actions")
+        if actions is None:
+            return None
+        if self.cot_plan is None:
+            self.cot_plan = self.tagged_text(response, "plan")
+            if self.cot_plan is None:
+                return None
+        assessment = self.tagged_text(response, "state")
+        if assessment is not None:
+            self.previous_assessment = assessment
+        self.executed_action_chunks.append([])
+        return actions
+
+    def queue_actions(self, navigation):
+        for command_index, (action_id, numeric) in enumerate(self.extract_multi_result(navigation)[:2]):
+            if action_id == 0:
+                self.pending_action_list.append((action_id, command_index))
+            elif action_id is not None:
+                unit = self.forward_distance if action_id == 1 else self.turn_angle
+                repeats = min(3, round(numeric / unit))
+                self.pending_action_list.extend([(action_id, command_index)] * repeats)
+            if action_id is None or not self.pending_action_list:
+                print("random select an action")
+                self.pending_action_list.append((random.randint(1, 3), command_index))
+
     def flush_video(self):
         if self.save_video and self.topdown_map_list:
             output_path = os.path.join(self.result_path, "video", self.video_name)
@@ -292,6 +400,9 @@ class SimpleVLN_Agent(Agent):
 
         self.pending_action_list = []
         self.rgb_list = []
+        self.cot_plan = None
+        self.previous_assessment = None
+        self.executed_action_chunks = []
 
         self.conversations = []
         self.conversations.append({
@@ -305,76 +416,40 @@ class SimpleVLN_Agent(Agent):
         if self.resolution_ratio < 1:
             rgb = cv2.resize(rgb,(0,0),fx=self.resolution_ratio,fy=self.resolution_ratio)
         rgb_ = Image.fromarray(rgb.astype('uint8')).convert('RGB')
-        self.rgb_list.append(rgb_)
-        # Keep the most recent observations within the configured history window.
-        if len(self.rgb_list) > self.max_action_history:
+        # Cache encoded frames so CoT can sample from the whole episode.
+        self.rgb_list.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{encode_image_base64(rgb_)}"},
+        })
+        if self.policy_format == "legacy" and len(self.rgb_list) > self.max_action_history:
             self.rgb_list = self.rgb_list[1:]
 
         if self.save_video:
             top_down_map = maps.colorize_draw_agent_and_fit_to_height(info["top_down_map"], rgb.shape[0])
             output_im = np.concatenate((rgb, top_down_map), axis=1)
 
-        if len(self.pending_action_list) != 0 :
-            temp_action = self.pending_action_list.pop(0)
-            
+        if self.pending_action_list:
             if self.save_video:
-                img = self.addtext(output_im, observations["instruction"]["text"], "Pending action: {}".format(temp_action))
+                action_id, _ = self.pending_action_list[0]
+                img = self.addtext(output_im, observations["instruction"]["text"], f"Pending action: {action_id}")
                 self.topdown_map_list.append(img)
-            return {"action": temp_action}
-
-        self.conversations = self.conversations[:1]
-        content = []
-
-        content.append({"type": "text", "text": 'Imagine you are a robot programmed for navigation tasks. You have been given a video of historical observations'})
-        if len(self.rgb_list) > 1:
-            content.extend([{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image_base64(item)}"}} for item in self.uniform_sample_with_ends(self.rgb_list[:-1],8)])
         else:
-            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image_base64(self.rgb_list[-1])}"}})
-        content.append({"type": "text", "text": ' and an image of the current observation'})
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_image_base64(self.rgb_list[-1])}"}})
-        item = self.promt_template.format(observations["instruction"]["text"]).split('current observation.', 1)
-        content.append({"type": "text", "text": "." + item[1]})
-
-
-        self.conversations.append({
-                "role": "user",
-                "content": content
+            instruction = observations["instruction"]["text"]
+            self.conversations = self.conversations[:1]
+            self.conversations.append({
+                "role": "user", "content": self.user_content(instruction),
             })
+            navigation = self.predict_inference()
+            if self.save_video:
+                self.topdown_map_list.append(self.addtext(output_im, instruction, navigation))
+            if self.policy_format == "cot":
+                navigation = self.read_cot_response(navigation)
+                if navigation is None:
+                    return None
+            self.queue_actions(navigation)
 
-        navigation = self.predict_inference()
-        
-        if self.save_video:
-            img = self.addtext(output_im, observations["instruction"]["text"], navigation)
-            self.topdown_map_list.append(img)
-        
-        result = self.extract_multi_result(navigation)
-
-        select_action_idx = 2
-
-        result = result[:select_action_idx]
-        for action_index,numeric in result:
-
-            if action_index == 0:
-                self.pending_action_list.append(0)
-            elif action_index == 1:
-                for _ in range(min(3, round(numeric/self.forward_distance))):
-                    self.pending_action_list.append(1)
-
-            elif action_index == 2:
-                for _ in range(min(3,round(numeric/self.turn_angle))):
-                    self.pending_action_list.append(2)
-
-            elif action_index == 3:
-                for _ in range(min(3,round(numeric/self.turn_angle))):
-                    self.pending_action_list.append(3)
-            
-            if action_index is None or len(self.pending_action_list)==0:
-                print('random select an action')
-                action_index = random.randint(1, 3)
-                navigation = self.action_id_to_str(action_index)
-                self.pending_action_list.append(action_index)
-
-        return {"action": self.pending_action_list.pop(0)}
+        action_id, self.command_index = self.pending_action_list.pop(0)
+        return {"action": action_id}
 
 
 def resolve_vllm_urls(args):
@@ -411,7 +486,8 @@ def main():
     parser.add_argument("--result-path",type=str,required=True,help="location to save results")
     parser.add_argument("--forward-distance",type=int,help="distance that one forward action takes",default=25)
     parser.add_argument("--turn-angle",type=int,help="angle that one turn action takes",default=15)
-    parser.add_argument("--max-action-history",type=int,help="the maximum num of action history",default=10)
+    parser.add_argument("--max-action-history", type=int, default=10,
+                        help="legacy policy observation-history window, including the current frame")
     parser.add_argument("--max-episodes", type=int, default=None,
                         help="evaluate only the first N episodes (use a separate result directory)")
     parser.add_argument("--sim-gpu-ids", default=None,
@@ -428,6 +504,10 @@ def main():
     parser.add_argument("--vllm_num_servers", type=int, default=8,
                         help="number of vLLM servers (ports: port_start ~ port_start+num-1)")
     parser.add_argument("--vllm_model_name", type=str, default="qwen3vl")
+    parser.add_argument("--policy-format", choices=("legacy", "cot"), default="legacy",
+                        help="navigation prompt and response format")
+    parser.add_argument("--max-completion-tokens", type=int, default=None,
+                        help="maximum generated tokens per decision (legacy: 512, cot: 1024)")
     parser.add_argument(
         "--save-video", "--save_vedio", dest="save_video",
         action="store_true",
@@ -449,6 +529,8 @@ def main():
             parser.error("--sim-gpu-ids must index the devices in CUDA_VISIBLE_DEVICES")
     if args.max_episodes is not None and args.max_episodes <= 0:
         parser.error("--max-episodes must be positive")
+    if args.max_completion_tokens is not None and args.max_completion_tokens <= 0:
+        parser.error("--max-completion-tokens must be positive")
     try:
         vllm_base_url = resolve_vllm_urls(args)
     except ValueError as exc:
@@ -540,6 +622,8 @@ def run_evaluation(args, vllm_base_url):
                 args.save_video,
                 args.pass_k,
                 done_rows,
+                getattr(args, "policy_format", "legacy"),
+                getattr(args, "max_completion_tokens", None),
             )
             p = mp.Process(target=evaluate_agent, args=worker_args, daemon=True)
             p.start()

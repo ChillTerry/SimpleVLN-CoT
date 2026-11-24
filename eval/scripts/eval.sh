@@ -18,6 +18,7 @@ VLLM_HOST="${VLLM_HOST:-http://localhost}"
 VLLM_PORT_START="${VLLM_PORT_START:-22001}"
 VLLM_NUM_SERVERS="${VLLM_NUM_SERVERS:-8}"
 VLLM_MODEL_NAME="${VLLM_MODEL_NAME:-qwen3vl}"
+POLICY_FORMAT="${POLICY_FORMAT:-legacy}"
 
 SPLIT_NUM="${SPLIT_NUM:-64}"
 PASS_K="${PASS_K:-4}"
@@ -39,11 +40,15 @@ run_one() {
     if [[ -n "${MAX_EPISODES:-}" ]]; then
         eval_args+=(--max-episodes "$MAX_EPISODES")
     fi
+    if [[ -n "${MAX_COMPLETION_TOKENS:-}" ]]; then
+        eval_args+=(--max-completion-tokens "$MAX_COMPLETION_TOKENS")
+    fi
     "${PYTHON}" vln/eval.py \
         --exp-config "${cfg}" \
         "${server_args[@]}" \
         "${eval_args[@]}" \
         --vllm_model_name "${VLLM_MODEL_NAME}" \
+        --policy-format "${POLICY_FORMAT}" \
         --split-num "${SPLIT_NUM}" \
         --pass-k "${PASS_K}" \
         --result-path "${out}" \

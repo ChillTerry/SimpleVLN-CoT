@@ -89,7 +89,8 @@ sys.exit(9)
 ''')
             fake.chmod(0o755)
             env = {**os.environ, 'PYTHON': str(fake), 'EXP_NAME': 'mock',
-                   'CAPTURE': str(path / 'capture'), 'VLLM_BASE_URL': 'https://host:8443/v1'}
+                   'CAPTURE': str(path / 'capture'), 'VLLM_BASE_URL': 'https://host:8443/v1',
+                   'POLICY_FORMAT': 'cot', 'MAX_COMPLETION_TOKENS': '1234'}
             result = subprocess.run(['bash', str(ROOT / 'scripts/eval.sh')],
                                     cwd=folder, env=env, capture_output=True, timeout=10)
             self.assertEqual(result.returncode, 9)
@@ -97,6 +98,8 @@ sys.exit(9)
             self.assertEqual(len(lines), 1)
             argv = json.loads(lines[0])
             self.assertEqual(argv[argv.index('--vllm_base_url') + 1], env['VLLM_BASE_URL'])
+            self.assertEqual(argv[argv.index('--policy-format') + 1], 'cot')
+            self.assertEqual(argv[argv.index('--max-completion-tokens') + 1], '1234')
 
 
 if __name__ == '__main__':

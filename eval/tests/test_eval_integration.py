@@ -66,6 +66,57 @@ class Progress:
 
 
 class IntegrationTests(unittest.TestCase):
+    def test_cot_failure_uses_current_metrics_and_continues_trials(self):
+        episode = SimpleNamespace(scene_id='/scenes/scene/a.glb', episode_id='1', fail=False,
+                                  instruction=SimpleNamespace(instruction_text='Go forward'))
+        dataset = Dataset([episode])
+        attempted_actions = iter([None, {'action': 1}, None, {'action': 0}])
+        stepped_actions = []
+        recorded_actions = []
+
+        class CotEnvironment(Environment):
+            def reset(self):
+                self.distance = 2
+                stepped_actions.append([])
+                return super().reset()
+
+            def step(self, action):
+                stepped_actions[-1].append(action['action'])
+                self.episode_over = action['action'] == 0
+                if action['action'] == 1:
+                    self.distance -= .25
+                return {}
+
+            def get_metrics(self):
+                return dict(success=1, spl=.5, oracle_success=1, distance_to_goal=self.distance,
+                            path_length=2 - self.distance, ndtw=.6, sdtw=.6)
+
+        class CotAgent(Agent):
+            def act(self, *args):
+                return next(attempted_actions)
+
+            def record_action(self, action_id):
+                recorded_actions.append(action_id)
+
+        tree = ast.parse((ROOT / 'vln/eval.py').read_text())
+        worker = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                      and node.name == 'evaluate_agent')
+        ns = dict(Env=CotEnvironment, SimpleVLN_Agent=CotAgent, time=time, quote=quote)
+        exec(compile(ast.Module(body=[worker], type_ignores=[]), '<eval>', 'exec'), ns)
+        trials = []
+        with tempfile.TemporaryDirectory() as path:
+            ns['evaluate_agent'](SimpleNamespace(put=trials.append), 'http://localhost/v1',
+                                 'mock', SimpleNamespace(habitat=None), dataset, path,
+                                 25, 15, 10, 1, False, 3, {}, policy_format='cot')
+        self.assertEqual(stepped_actions, [[], [1], [0]])
+        self.assertEqual(recorded_actions, [1, 0])
+        self.assertEqual([trial['success'] for trial in trials], [0, 0, 1])
+        rows = [trial['result_row'] for trial in trials]
+        self.assertEqual([(row['steps'], row['success'], row['spl'], row['sdtw']) for row in rows],
+                         [(0, 0, 0, 0), (1, 0, 0, 0), (1, 1, .5, .6)])
+        self.assertEqual([(row['ne'], row['os'], row['ndtw'], row['path_length']) for row in rows[:2]],
+                         [(2, 1, .6, 0), (1.75, 1, .6, .25)])
+
     @unittest.skipUnless('fork' in mp.get_all_start_methods(), 'Test uses Linux fork workers')
     def test_multiprocess_results_and_resume(self):
         episodes = [SimpleNamespace(scene_id='/scenes/scene/a.glb', episode_id=str(i),

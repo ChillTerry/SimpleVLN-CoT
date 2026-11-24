@@ -178,13 +178,30 @@ resources and `VLLM_NUM_SERVERS` to the number of model services.
 | `VLLM_MODEL_NAME` | `qwen3vl` | Served model name |
 | `SPLIT_NUM` | `64` | Simulator workers |
 | `PASS_K` | `4` | Trials per episode |
-| `MAX_ACTION_HISTORY` | `200` | Retained observation-history window |
+| `MAX_ACTION_HISTORY` | `200` | Retained observation-history window in legacy mode |
+| `POLICY_FORMAT` | `legacy` | Set to `cot` for CoT checkpoints |
+| `MAX_COMPLETION_TOKENS` | `512` (legacy), `1024` (CoT) | Output token budget per decision |
 | `RESULT_ROOT` | `./results` | Output root, relative to the evaluation module |
 
 The example above overrides the worker count, service count, and number of
 trials. Use a distinct `EXP_NAME` for each checkpoint and evaluation configuration.
 
 </details>
+
+### CoT SFT Checkpoints
+
+Serve the CoT checkpoint using `MODEL_PATH`, then run both benchmarks with the CoT policy format.
+
+```bash
+MODEL_PATH=/path/to/cot-checkpoint bash eval/scripts/serve_vllm.sh 1 1
+
+POLICY_FORMAT=cot EXP_NAME=cot_smoke VLLM_NUM_SERVERS=1 \
+SPLIT_NUM=3 PASS_K=1 MAX_EPISODES=3 bash eval/scripts/eval.sh
+```
+
+The evaluator carries the plan, latest state text, and executed actions forward within each
+trial. It executes up to two commands per decision. A missing `<plan>` on the first decision
+or a missing `<actions>` on any decision scores the trial as a failure at the current position.
 
 ### Remote Inference
 
@@ -231,10 +248,10 @@ The `--save-video` option saves trajectory GIFs for completed trials.
 | Turn angle | 15° |
 | Success threshold | 3 m |
 | Historical observations per request | Up to 8, uniformly sampled |
-| Decoding | Temperature 0.3, top-p 0.95, maximum 512 output tokens |
+| Decoding | Temperature 0.3, top-p 0.95, maximum 512 output tokens for legacy and 1024 for CoT |
 
 The system prompt is `You are a visual language navigation model.`
-Request text and image ordering follow `DataProcess/tool/convert_vln.py`.
+Legacy request text and image ordering follow `DataProcess/tool/convert_vln.py`.
 
 The current observation is provided alongside the sampled history. On the first
 decision, the initial frame occupies both the history and current-observation
