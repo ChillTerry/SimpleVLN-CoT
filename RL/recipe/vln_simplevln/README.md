@@ -135,6 +135,24 @@ than the service's `--pool-size` to avoid retries for a free worker.
 Start a Ray cluster in the training environment, with all nodes using the same
 code, model files, and compatible dependencies. See the
 [Ray cluster guide](https://docs.ray.io/en/latest/cluster/vms/user-guides/launching-clusters/on-premises.html).
+For the head node, [start_ray.sh](start_ray.sh) configures Ray storage through
+three environment variables and forwards other arguments to `ray start`:
+
+```bash
+RAY_LOG_DIR=/data/simplevln-ray \
+RAY_SPILL_DIR=/data/simplevln-ray/spill \
+RAY_LOCAL_FS_CAPACITY_THRESHOLD=0.99 \
+bash recipe/vln_simplevln/start_ray.sh --port=6380 --num-gpus=8
+```
+
+These are the defaults; spill defaults to `${RAY_LOG_DIR}/spill`. Ray logs are in
+`${RAY_LOG_DIR}/session_latest/logs`. `RAY_TMPDIR` remains a fallback when
+`RAY_LOG_DIR` is unset. Use the same directory setting for training, and set
+`RAY_ADDRESS=127.0.0.1:6380` for this example. These options apply when Ray starts;
+passing them to a training process that connects to an existing cluster does not
+reconfigure it. The threshold raises Ray's disk capacity limit to 99%; actual
+disk write failures still propagate.
+
 Run the training launcher once on the head node. It connects through
 `RAY_ADDRESS=auto`; set `RAY_ADDRESS` explicitly for another cluster address.
 
