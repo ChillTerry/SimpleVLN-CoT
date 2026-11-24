@@ -7,10 +7,8 @@ from contextlib import nullcontext, redirect_stderr
 from copy import deepcopy
 from io import BytesIO, StringIO
 from itertools import groupby
-import os
 from pathlib import Path
 import re
-import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -35,8 +33,6 @@ class Frame:
 
 class NavigationTests(unittest.TestCase):
     def setUp(self):
-        self.folder = tempfile.TemporaryDirectory()
-        self.addCleanup(self.folder.cleanup)
         self.requests = []
         self.output = 'forward 25 cm'
 
@@ -52,7 +48,7 @@ class NavigationTests(unittest.TestCase):
                  or isinstance(n, ast.FunctionDef) and n.name == 'encode_image_base64']
         nodes = [n for n in nodes if not isinstance(n, ast.Assign)
                  or any(isinstance(t, ast.Name) and t.id == 'SYSTEM_PROMPT' for t in n.targets)]
-        namespace = dict(Agent=object, OpenAI=client, os=os, re=re, BytesIO=BytesIO,
+        namespace = dict(Agent=object, OpenAI=client, re=re, BytesIO=BytesIO,
                          base64=base64, groupby=groupby, Image=SimpleNamespace(fromarray=lambda x: x),
                          random=SimpleNamespace(randint=lambda a, b: 3))
         exec(compile(ast.Module(body=nodes, type_ignores=[]), '<navigation>', 'exec'), namespace)
@@ -61,7 +57,7 @@ class NavigationTests(unittest.TestCase):
 
     def make_agent(self, **kwargs):
         return self.agent_class(
-            'http://server-a/v1,http://server-b/v1', 'model', self.folder.name,
+            'http://server-a/v1,http://server-b/v1', 'model',
             25, 15, 10, 1.0, **kwargs)
 
     def act(self, frame):
@@ -134,9 +130,12 @@ class NavigationTests(unittest.TestCase):
             self.assertEqual(prompt, build_prompt('Go to the door.', count))
 
     def test_actions_are_limited_and_pending_actions_avoid_extra_requests(self):
-        self.output = '<think>plan\nnext move</think>forward 150 cm, left 30 degrees, right 90 degrees'
+        raw_outputs = []
+        self.agent = self.make_agent(on_model_output=raw_outputs.append)
+        self.output = ' \n<think>plan\nnext move</think>forward 150 cm, left 30 degrees, right 90 degrees '
         self.assertEqual([self.act(i) for i in range(5)], [1, 1, 1, 2, 2])
         self.assertEqual(len(self.requests), 1)
+        self.assertEqual(raw_outputs, [self.output])
         self.agent.reset()
         self.output = 'stop'
         self.assertEqual(self.act(5), 0)
@@ -187,9 +186,12 @@ class NavigationTests(unittest.TestCase):
         self.assertNotIn('Executed actions', self.latest_prompt())
 
     def test_cot_requires_closed_blocks_and_accepts_empty_plan_text(self):
-        self.agent = self.make_agent(policy_format='cot', max_completion_tokens=200)
-        for response in ('<actions>stop</actions>', '<plan>unclosed<actions>stop</actions>',
-                         '<plan>goal</plan><actions>stop', None):
+        raw_outputs = []
+        self.agent = self.make_agent(policy_format='cot', max_completion_tokens=200,
+                                    on_model_output=raw_outputs.append)
+        bad_responses = ['<actions>stop</actions>', '<plan>unclosed<actions>stop</actions>',
+                         '<plan>goal</plan><actions>stop', None]
+        for response in bad_responses:
             with self.subTest(response=response):
                 self.agent.reset()
                 self.output = response
@@ -197,6 +199,7 @@ class NavigationTests(unittest.TestCase):
                 self.assertIsNone(self.act(0))
                 self.assertEqual(len(self.requests), requests_before + 1)
                 self.assertEqual(self.requests[-1][1]['max_completion_tokens'], 200)
+        self.assertEqual(raw_outputs, bad_responses)
 
         self.output = '<plan></plan><actions>forward 25 cm</actions>'
         self.assertEqual(self.act(0), 1)
@@ -226,6 +229,9 @@ class CommandLineTests(unittest.TestCase):
                          run_evaluation=lambda args, _: calls.append(args), print=lambda *a: None)
         exec(compile(ast.Module(body=[node], type_ignores=[]), '<cli>', 'exec'), namespace)
         argv = ['eval.py', '--exp-config', 'config.yaml', '--split-num', '1', '--result-path', 'results']
+        with patch('sys.argv', argv):
+            namespace['main']()
+        self.assertFalse(calls[-1].save_video)
         for video_flag in ('--save-video', '--save_vedio'):
             with patch('sys.argv', argv + [video_flag, '--num-generations', '1']):
                 namespace['main']()

@@ -43,6 +43,9 @@ run_one() {
     if [[ -n "${MAX_COMPLETION_TOKENS:-}" ]]; then
         eval_args+=(--max-completion-tokens "$MAX_COMPLETION_TOKENS")
     fi
+    if [[ "${SAVE_VIDEO:-0}" == 1 ]]; then
+        eval_args+=(--save-video)
+    fi
     "${PYTHON}" vln/eval.py \
         --exp-config "${cfg}" \
         "${server_args[@]}" \

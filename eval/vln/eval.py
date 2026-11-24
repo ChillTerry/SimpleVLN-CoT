@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+from contextlib import ExitStack
 from copy import deepcopy
 from io import BytesIO
 from itertools import groupby
@@ -12,23 +13,18 @@ from queue import Empty
 import random
 import re
 import time
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 import cv2
+from episode_artifacts import EpisodeArtifacts
 from habitat import Env
 import habitat
 from habitat.core.agent import Agent
-import imageio
 import numpy as np
-from habitat.utils.visualizations import maps
 from habitat_extensions import measures, task
 _ = (measures, task)  # Register custom measures and datasets with Habitat.
 from habitat_baselines.config.default import get_config
-from habitat.config.default_structured_configs import (
-    CollisionsMeasurementConfig,
-    FogOfWarConfig,
-    TopDownMapMeasurementConfig,
-)
+from habitat.config.default_structured_configs import TopDownMapMeasurementConfig
 from PIL import Image
 from tqdm import tqdm
 from result_store import append_result, load_result_rows, result_directory_lock
@@ -51,20 +47,22 @@ def evaluate_agent(result_queue, base_url, model_name, config, dataset, result_p
                     save_video, pass_k, done_rows, policy_format="legacy",
                     max_completion_tokens=None) -> None:
 
-    env = Env(config.habitat, dataset)
-
-    try:
+    with ExitStack() as resources:
+        env = Env(config.habitat, dataset)
+        resources.callback(env.close)
+        artifacts = EpisodeArtifacts(result_path, pass_k) if save_video else None
+        if artifacts is not None:
+            resources.callback(artifacts.close)
         agent = SimpleVLN_Agent(
             base_url,
             model_name,
-            result_path,
             forward_distance,
             turn_angle,
             max_action_history,
             resolution_ratio,
-            save_video=save_video,
             policy_format=policy_format,
             max_completion_tokens=max_completion_tokens,
+            on_model_output=artifacts.record_output if artifacts is not None else None,
         )
 
         episodes_snapshot = list(env.episodes)
@@ -88,16 +86,16 @@ def evaluate_agent(result_queue, base_url, model_name, config, dataset, result_p
                 obs = env.reset()
                 iter_step = 0
                 agent.reset()
-                agent.video_name = (
-                    f"{quote(scene_id, safe='')}_{quote(str(episode_id), safe='')}_"
-                    f"pass{pass_k}_trial{trial_id}.gif"
-                )
+                if artifacts is not None:
+                    artifacts.start(episode_id, episode_instruction, trial_id)
                 t_dict = {"t_episode": 0}
                 continuse_rotation_count = 0
                 last_dtg = 999
                 missing_required_block = False
                 while not env.episode_over:
                     info = env.get_metrics()
+                    if artifacts is not None:
+                        artifacts.write_frame(obs, info)
 
                     if info["distance_to_goal"] != last_dtg:
                         last_dtg = info["distance_to_goal"]
@@ -137,30 +135,27 @@ def evaluate_agent(result_queue, base_url, model_name, config, dataset, result_p
                     result["sdtw"] = 0.0 if missing_required_block else info["sdtw"]
                 if "path_length" in info:
                     result["path_length"] = info["path_length"]
-                agent.flush_video()
+                if artifacts is not None:
+                    if not missing_required_block:
+                        artifacts.write_frame(obs, info)
+                    artifacts.finish(result["success"])
                 t_dict["t_episode"] = time.time() - episode_start_time
                 t_dict["success"] = float(result["success"])
                 t_dict["result_row"] = result
                 result_queue.put(t_dict)
-    finally:
-        env.close()
 
 
 class SimpleVLN_Agent(Agent):
-    def __init__(self, base_url, model_name, result_path, forward_distance,
+    def __init__(self, base_url, model_name, forward_distance,
                     turn_angle, max_action_history, resolution_ratio,
-                    save_video=False, policy_format="legacy", max_completion_tokens=None):
+                    policy_format="legacy", max_completion_tokens=None, on_model_output=None):
 
-        self.result_path = result_path
-        self.save_video = save_video
         self.forward_distance = forward_distance
         self.turn_angle = turn_angle
         self.resolution_ratio = resolution_ratio
         self.max_action_history = max_action_history
         self.policy_format = policy_format
-        os.makedirs(self.result_path, exist_ok=True)
-        if self.save_video:
-            os.makedirs(os.path.join(self.result_path, "video"), exist_ok=True)
+        self.on_model_output = on_model_output
 
         urls = [u.strip() for u in base_url.split(",") if u.strip()]
         self.clients = [OpenAI(base_url=url, api_key="dummy", timeout=600) for url in urls]
@@ -177,7 +172,6 @@ class SimpleVLN_Agent(Agent):
             "You have been given a video of historical observations and an image of the current observation. "\
             "Your assigned task is: '{}'. Analyze this series of images to decide your next move, "\
             "which could involve turning left or right by a specific degree or moving forward a certain distance."
-        self.topdown_map_list = []
         self.reset()
 
     def uniform_sample_with_ends(self, data, n):
@@ -202,6 +196,8 @@ class SimpleVLN_Agent(Agent):
         )
 
         output_text = outputs.choices[0].message.content
+        if self.on_model_output is not None:
+            self.on_model_output(output_text)
         if output_text is None and self.policy_format == "cot":
             return ""
         output_text = re.sub(r'<think>.*?</think>', '', output_text, flags=re.DOTALL)
@@ -246,42 +242,6 @@ class SimpleVLN_Agent(Agent):
             return 3, float(match)
         return None, None
     
-
-    def addtext(self, image, instuction, navigation):
-        h, w = image.shape[:2]
-        new_height = h + 150
-        new_image = np.zeros((new_height, w, 3), np.uint8)
-        new_image.fill(255)  
-        new_image[:h, :w] = image
-
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        textsize = cv2.getTextSize(instuction, font, 0.5, 2)[0]
-        textY = h + (50 + textsize[1]) // 2
-
-        y_line = textY + 0 * textsize[1]
-
-        words = instuction.split(' ')
-        x = 10
-        line = ""
-
-        for word in words:
-
-            test_line = line + ' ' + word if line else word
-            test_line_size, _ = cv2.getTextSize(test_line, font, 0.5, 2)
-
-            if test_line_size[0] > image.shape[1] - x:
-                cv2.putText(new_image, line, (x, y_line ), font, 0.5, (0, 0, 0), 2)
-                line = word
-                y_line += textsize[1]+5
-            else:
-                line = test_line
-
-        if line:
-            cv2.putText(new_image, line, (x, y_line), font, 0.5, (0, 0, 0), 2)
-        y_line = y_line + 1 * textsize[1] + 10
-        new_image = cv2.putText(new_image, navigation, (x, y_line), font, 0.5, (0, 0, 0), 2)
-
-        return new_image
 
     def action_id_to_str(self,action_id):
         # id: 0-stop, 1 move forward, 2 turn left, 3 turn right
@@ -388,16 +348,7 @@ class SimpleVLN_Agent(Agent):
                 print("random select an action")
                 self.pending_action_list.append((random.randint(1, 3), command_index))
 
-    def flush_video(self):
-        if self.save_video and self.topdown_map_list:
-            output_path = os.path.join(self.result_path, "video", self.video_name)
-            imageio.mimsave(output_path, self.topdown_map_list)
-            self.topdown_map_list = []
-
     def reset(self):
-        self.flush_video()
-        self.topdown_map_list = []
-
         self.pending_action_list = []
         self.rgb_list = []
         self.cot_plan = None
@@ -424,24 +375,13 @@ class SimpleVLN_Agent(Agent):
         if self.policy_format == "legacy" and len(self.rgb_list) > self.max_action_history:
             self.rgb_list = self.rgb_list[1:]
 
-        if self.save_video:
-            top_down_map = maps.colorize_draw_agent_and_fit_to_height(info["top_down_map"], rgb.shape[0])
-            output_im = np.concatenate((rgb, top_down_map), axis=1)
-
-        if self.pending_action_list:
-            if self.save_video:
-                action_id, _ = self.pending_action_list[0]
-                img = self.addtext(output_im, observations["instruction"]["text"], f"Pending action: {action_id}")
-                self.topdown_map_list.append(img)
-        else:
+        if not self.pending_action_list:
             instruction = observations["instruction"]["text"]
             self.conversations = self.conversations[:1]
             self.conversations.append({
                 "role": "user", "content": self.user_content(instruction),
             })
             navigation = self.predict_inference()
-            if self.save_video:
-                self.topdown_map_list.append(self.addtext(output_im, instruction, navigation))
             if self.policy_format == "cot":
                 navigation = self.read_cot_response(navigation)
                 if navigation is None:
@@ -511,7 +451,7 @@ def main():
     parser.add_argument(
         "--save-video", "--save_vedio", dest="save_video",
         action="store_true",
-        help="if set, save per-episode top-down+gifs under result-path/video",
+        help="save episode MP4s and model output JSON under result-path/video/eval",
     )
     args = parser.parse_args()
 
@@ -552,29 +492,10 @@ def run_evaluation(args, vllm_base_url):
         raise ValueError("--forward-distance (cm) must match simulator.forward_step_size (m)")
     if abs(config.habitat.simulator.turn_angle - args.turn_angle) > 1e-6:
         raise ValueError("--turn-angle must match simulator.turn_angle")
-    with habitat.config.read_write(config):
-        if args.save_video:
-            config.habitat.task.measurements.update(
-                {
-                    "top_down_map": TopDownMapMeasurementConfig(
-                        map_padding=3,
-                        map_resolution=1024,
-                        draw_source=True,
-                        draw_border=True,
-                        draw_shortest_path=True,
-                        draw_view_points=True,
-                        draw_goal_positions=True,
-                        draw_goal_aabbs=True,
-                        fog_of_war=FogOfWarConfig(
-                            draw=True,
-                            visibility_dist=5.0,
-                            fov=90,
-                        ),
-                    ),
-                    "collisions": CollisionsMeasurementConfig(),
-                }
-            )
-            
+    if args.save_video:
+        with habitat.config.read_write(config):
+            config.habitat.task.measurements["top_down_map"] = TopDownMapMeasurementConfig()
+
     dataset = habitat.datasets.make_dataset(id_dataset=config.habitat.dataset.type, config=config.habitat.dataset)
     dataset.config = config.habitat.dataset
     if getattr(args, "max_episodes", None) is not None:
@@ -582,6 +503,8 @@ def run_evaluation(args, vllm_base_url):
     num_episodes = len(dataset.episodes)
     if not num_episodes:
         raise ValueError("The configured dataset contains no episodes")
+    if args.save_video and len({str(ep.episode_id) for ep in dataset.episodes}) != num_episodes:
+        raise ValueError("--save-video requires unique episode IDs")
     split_num = min(args.split_num, num_episodes)
     dataset_splits = dataset.get_splits(split_num, allow_uneven_splits=True)
     for ds in dataset_splits:

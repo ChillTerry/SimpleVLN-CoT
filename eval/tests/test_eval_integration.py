@@ -1,11 +1,10 @@
 """Exercise real multiprocessing orchestration with a tiny simulator substitute."""
 import ast
-from contextlib import nullcontext, redirect_stdout
+from contextlib import ExitStack, nullcontext, redirect_stdout
 import io
 import json
 import math
 import multiprocessing as mp
-import os
 from pathlib import Path
 from queue import Empty
 import sys
@@ -13,7 +12,7 @@ import tempfile
 import time
 from types import SimpleNamespace
 import unittest
-from urllib.parse import quote
+from unittest.mock import call, Mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'vln'))
@@ -47,14 +46,11 @@ class Environment:
 
 class Agent:
     def __init__(self, *args, **kwargs):
-        self.path = Path(args[2])
+        pass
     def reset(self):
         pass
     def act(self, *args):
         return {'action': 0}
-    def flush_video(self):
-        # Verify orchestration supplies a unique filename and flushes the final trial.
-        (self.path / self.video_name).write_text('mock video')
 
 
 class Progress:
@@ -101,13 +97,15 @@ class IntegrationTests(unittest.TestCase):
         tree = ast.parse((ROOT / 'vln/eval.py').read_text())
         worker = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                       and node.name == 'evaluate_agent')
-        ns = dict(Env=CotEnvironment, SimpleVLN_Agent=CotAgent, time=time, quote=quote)
+        artifacts = Mock()
+        ns = dict(Env=CotEnvironment, SimpleVLN_Agent=CotAgent, time=time, ExitStack=ExitStack,
+                  EpisodeArtifacts=lambda *args: artifacts)
         exec(compile(ast.Module(body=[worker], type_ignores=[]), '<eval>', 'exec'), ns)
         trials = []
         with tempfile.TemporaryDirectory() as path:
             ns['evaluate_agent'](SimpleNamespace(put=trials.append), 'http://localhost/v1',
                                  'mock', SimpleNamespace(habitat=None), dataset, path,
-                                 25, 15, 10, 1, False, 3, {}, policy_format='cot')
+                                 25, 15, 10, 1, True, 3, {}, policy_format='cot')
         self.assertEqual(stepped_actions, [[], [1], [0]])
         self.assertEqual(recorded_actions, [1, 0])
         self.assertEqual([trial['success'] for trial in trials], [0, 0, 1])
@@ -116,6 +114,13 @@ class IntegrationTests(unittest.TestCase):
                          [(0, 0, 0, 0), (1, 0, 0, 0), (1, 1, .5, .6)])
         self.assertEqual([(row['ne'], row['os'], row['ndtw'], row['path_length']) for row in rows[:2]],
                          [(2, 1, .6, 0), (1.75, 1, .6, .25)])
+        self.assertEqual(artifacts.start.call_args_list, [call('1', 'Go forward', i) for i in range(3)])
+        self.assertEqual(artifacts.finish.call_args_list, [call(0), call(0), call(1)])
+        self.assertEqual([action for action, _, _ in artifacts.mock_calls], [
+            'start', 'write_frame', 'finish',
+            'start', 'write_frame', 'write_frame', 'finish',
+            'start', 'write_frame', 'write_frame', 'finish', 'close',
+        ])
 
     @unittest.skipUnless('fork' in mp.get_all_start_methods(), 'Test uses Linux fork workers')
     def test_multiprocess_results_and_resume(self):
@@ -128,8 +133,8 @@ class IntegrationTests(unittest.TestCase):
                               task=SimpleNamespace(measurements={'path_length': {}})))
         habitat = SimpleNamespace(config=SimpleNamespace(read_write=lambda _: nullcontext()),
                                   datasets=SimpleNamespace(make_dataset=lambda **_: dataset))
-        ns = dict(Env=Environment, SimpleVLN_Agent=Agent, time=time, quote=quote,
-                  os=os, json=json, mp=mp.get_context('fork'), Empty=Empty,
+        ns = dict(Env=Environment, SimpleVLN_Agent=Agent, time=time, ExitStack=ExitStack,
+                  json=json, mp=mp.get_context('fork'), Empty=Empty,
                   np=SimpleNamespace(isfinite=math.isfinite), tqdm=Progress,
                   habitat=habitat, get_config=lambda _: cfg,
                   load_result_rows=load_result_rows, append_result=append_result)
@@ -147,7 +152,7 @@ class IntegrationTests(unittest.TestCase):
             records = [json.loads(line) for line in (Path(path) / 'result.json').read_text().splitlines()]
             self.assertEqual(len(records), 5)  # 4 trials plus summary, all valid JSON
             self.assertEqual(records[-1]['pass@2'], 1)
-            self.assertEqual(len(list(Path(path).glob('*.gif'))), 4)
+            self.assertFalse((Path(path) / 'video').exists())
             # Simulate duplicates and a different pass-k in a reused output directory.
             append_result(path, records[0])
             append_result(path, {**records[0], 'trial_total': 1, 'trial_id': 0, 'success': 0})

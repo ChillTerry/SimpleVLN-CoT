@@ -181,6 +181,7 @@ resources and `VLLM_NUM_SERVERS` to the number of model services.
 | `MAX_ACTION_HISTORY` | `200` | Retained observation-history window in legacy mode |
 | `POLICY_FORMAT` | `legacy` | Set to `cot` for CoT checkpoints |
 | `MAX_COMPLETION_TOKENS` | `512` (legacy), `1024` (CoT) | Output token budget per decision |
+| `SAVE_VIDEO` | `0` | Set to `1` to save MP4s and model output JSON |
 | `RESULT_ROOT` | `./results` | Output root, relative to the evaluation module |
 
 The example above overrides the worker count, service count, and number of
@@ -235,7 +236,25 @@ python eval/vln/eval.py \
 ```
 
 Use `eval/config/vln_rxr.yaml` for RxR-CE and a separate output directory.
-The `--save-video` option saves trajectory GIFs for completed trials.
+
+### Episode Videos and Model Outputs
+
+Pass `--save-video` (alias `--save_vedio`) or set `SAVE_VIDEO=1` for the shell
+launcher. Each completed trial saves an MP4 and a matching JSON file in
+`<result-path>/video/eval/success/` or `failure/` according to its success metric.
+For one trial, the files are named `<episode_id>.mp4` and `<episode_id>.json`.
+With `--pass-k` greater than one, the stem is `<episode_id>_<trial_id>` with a
+zero-based trial ID.
+
+The video displays RGB and the top-down map side by side above the instruction.
+It uses H.264 at 1 FPS and is 1280 × 592 with the supplied configs. The JSON
+contains `episode_id`, the full `instruction`, and `outputs` entries with
+`current_frame_index` and the raw `model_output` from each inference request.
+The reset observation is frame 0. Each simulator step adds one frame, including
+the final observation. Queued actions add frames between inference requests.
+
+A resumed run records trials that still need evaluation. Use a new result
+directory to record trials that already have completed metrics.
 
 ### Evaluation Settings
 
