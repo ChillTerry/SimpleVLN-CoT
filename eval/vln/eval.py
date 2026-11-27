@@ -4,11 +4,13 @@ import argparse
 import base64
 from contextlib import ExitStack
 from copy import copy, deepcopy
+from hashlib import sha256
 from io import BytesIO
 from itertools import chain, groupby
 import json
 import multiprocessing as mp
 import os
+from pathlib import Path
 from queue import Empty
 import random
 import re
@@ -486,6 +488,31 @@ def main():
         run_evaluation(args, vllm_base_url)
 
 
+def exclude_unreachable_rxr_episodes(dataset):
+    config = dataset.config
+    if config.type != "R2RVLN-v1" or config.split != "val_unseen":
+        return
+    annotation_path = Path(config.data_path.format(split=config.split))
+    # This digest identifies the RxR English guide annotations in the data manifest.
+    annotation_sha256 = "47e4111691a3e1792a75f8a17a9bfc56fee5071208464880ac63d0b74ce85db5"
+    if sha256(annotation_path.read_bytes()).hexdigest() != annotation_sha256:
+        return
+
+    # Each of these trajectories has three unreachable episodes in oLBMNvg9in8.
+    unreachable_trajectory_ids = {
+        "1011", "1291", "1680", "2073", "2242", "2265", "3136", "3803", "4148", "5247", "5602",
+        "6975", "7085", "7598", "7665", "8334", "9156", "9206", "9318", "9558", "10363", "10646",
+        "10738", "10884", "10996", "11226", "11327", "12970", "13523", "13557", "13686", "14574", "15754",
+    }
+    original_count = len(dataset.episodes)
+    dataset.episodes = [
+        episode for episode in dataset.episodes
+        if Path(episode.scene_id).stem != "oLBMNvg9in8"
+        or str(episode.trajectory_id) not in unreachable_trajectory_ids
+    ]
+    remaining_count = len(dataset.episodes)
+
+
 def run_evaluation(args, vllm_base_url):
     config = get_config(args.exp_config)
     if abs(config.habitat.simulator.forward_step_size * 100 - args.forward_distance) > 1e-6:
@@ -498,6 +525,7 @@ def run_evaluation(args, vllm_base_url):
 
     dataset = habitat.datasets.make_dataset(id_dataset=config.habitat.dataset.type, config=config.habitat.dataset)
     dataset.config = config.habitat.dataset
+    exclude_unreachable_rxr_episodes(dataset)
     if getattr(args, "max_episodes", None) is not None:
         dataset.episodes = dataset.episodes[:args.max_episodes]
     num_episodes = len(dataset.episodes)

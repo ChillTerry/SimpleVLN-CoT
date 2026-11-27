@@ -2,6 +2,7 @@
 import ast
 from contextlib import ExitStack, nullcontext, redirect_stdout
 from copy import copy, deepcopy
+from hashlib import sha256
 import io
 from itertools import chain
 import json
@@ -61,10 +62,12 @@ class Progress:
     def set_postfix(self, **kwargs): pass
 
 
-def run_mock_evaluation(dataset, result_path, *, environment=Environment, **overrides):
+def run_mock_evaluation(dataset, result_path, *, environment=Environment, dataset_config=None, **overrides):
     simulator = SimpleNamespace(forward_step_size=.25, turn_angle=15,
                                 habitat_sim_v0=SimpleNamespace(gpu_device_id=-1))
-    cfg = SimpleNamespace(habitat=SimpleNamespace(dataset=SimpleNamespace(type='mock'),
+    if dataset_config is None:
+        dataset_config = SimpleNamespace(type='mock')
+    cfg = SimpleNamespace(habitat=SimpleNamespace(dataset=dataset_config,
                           simulator=simulator, task=SimpleNamespace(measurements={'path_length': {}})))
     habitat = SimpleNamespace(
         datasets=SimpleNamespace(make_dataset=lambda **kwargs: dataset),
@@ -72,12 +75,14 @@ def run_mock_evaluation(dataset, result_path, *, environment=Environment, **over
     )
     ns = dict(Env=environment, SimpleVLN_Agent=Agent, time=time, ExitStack=ExitStack,
               chain=chain, copy=copy, deepcopy=deepcopy, json=json, mp=mp.get_context('fork'), Empty=Empty,
+              sha256=sha256, Path=Path,
               np=SimpleNamespace(isfinite=math.isfinite), tqdm=Progress,
               habitat=habitat, get_config=lambda _: cfg,
               load_result_rows=load_result_rows, append_result=append_result)
     tree = ast.parse((ROOT / 'vln/eval.py').read_text())
     functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in
-                 ('evaluate_agent', 'run_evaluation', 'evaluate_pending', 'stop_workers', 'summarize_results')]
+                 ('evaluate_agent', 'exclude_unreachable_rxr_episodes', 'run_evaluation',
+                  'evaluate_pending', 'stop_workers', 'summarize_results')]
     exec(compile(ast.Module(body=functions, type_ignores=[]), '<eval>', 'exec'), ns)
     args = SimpleNamespace(exp_config='mock', save_video=False, pass_k=2, split_num=64,
                            vllm_model_name='mock', result_path=result_path,
@@ -174,6 +179,38 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(len(records), 8)  # only a new summary on resume
             self.assertEqual(records[-1]['sucs_all'], 1)
             self.assertEqual(len(load_result_rows(path, pass_k=2)), 4)
+
+    @unittest.skipUnless('fork' in mp.get_all_start_methods(), 'Test uses Linux fork workers')
+    def test_rxr_filters_unreachable_episodes_before_limit_and_resume(self):
+        config = SimpleNamespace(
+            type='R2RVLN-v1', split='val_unseen',
+            data_path=str(ROOT / 'data/vln_data/eval_data/rxr/{split}/{split}_guide_en.json.gz'),
+        )
+        rxr_scene = 'oLBMNvg9in8'
+        episodes = [
+            SimpleNamespace(scene_id=f'/scenes/mp3d/{scene}/{scene}.glb', episode_id=str(index),
+                            trajectory_id=trajectory_id, fail=fail,
+                            instruction=SimpleNamespace(instruction_text='Go forward'))
+            for index, (scene, trajectory_id, fail) in enumerate([
+                (rxr_scene, '1011', True),
+                (rxr_scene, '1012', False),
+                ('other_scene', '1011', False),
+                (rxr_scene, '1013', True),
+            ])
+        ]
+        with tempfile.TemporaryDirectory() as path:
+            append_result(path, dict(scene_id=rxr_scene, episode_id=0, episode_instruction='Go forward',
+                                     trial_id=0, trial_total=2, success=0, spl=math.nan, os=0,
+                                     ne=math.inf, steps=1, path_length=0))
+            run_mock_evaluation(Dataset(episodes), path, dataset_config=config, max_episodes=2)
+            records = [json.loads(line) for line in (Path(path) / 'result.json').read_text().splitlines()]
+
+        self.assertTrue(math.isnan(records[0]['spl']))
+        self.assertEqual(sorted((r['episode_id'], r['trial_id']) for r in records[1:-1]),
+                         [(1, 0), (1, 1), (2, 0), (2, 1)])
+        self.assertEqual(records[-1]['pass@2'], 1)
+        self.assertEqual(records[-1]['spls_all'], .5)
+        self.assertEqual(records[-1]['ones_all'], 1)
 
     @unittest.skipUnless('fork' in mp.get_all_start_methods(), 'Test uses Linux fork workers')
     def test_fast_worker_takes_episodes_from_the_shared_queue(self):
