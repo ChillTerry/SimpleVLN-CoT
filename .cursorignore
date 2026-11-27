@@ -1,0 +1,16 @@
+# Cursor's own indexing / retrieval entry point.
+# This repository's data/ directory holds ~2.03M files. Letting Cursor walk it
+# triggers index handshake timeouts, i.e. the repeated
+# [deadline_exceeded] ensure index created / sync merkle subtree warnings in the
+# logs. Syntax is the same as .gitignore.
+
+data/
+outputs/
+logs/
+models/
+.cache/
+.venv/
+.venvs/
+.python/
+__pycache__/
+*.egg-info/

@@ -115,6 +115,39 @@ provided in the [data guide](data/vln_data/README.md) and
 
 ## Evaluation
 
+### Automatic GPU Allocation
+
+Run one benchmark with the Habitat Python interpreter and the vLLM executable
+on `PATH`.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+PATH="/path/to/vllm-env/bin:$PATH" \
+/path/to/habitat-env/bin/python eval/scripts/run_eval.py \
+  --benchmark rxr --policy-format cot \
+  --model-path /path/to/training-run/checkpoint \
+  --exp-name training-run/checkpoint
+```
+
+The launcher starts one vLLM replica per eligible GPU and sizes the Habitat
+worker pool from the remaining memory. All workers pull episodes from a single
+queue. The defaults are pass@1 with video disabled. Logs go to
+`eval/logs/<exp-name>/` and trial results go to
+`eval/results/<exp-name>/<benchmark>_pass<K>/result.json`. Reusing the same
+experiment name and settings resumes unfinished trials.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--vllm-memory-utilization` | `0.50` | vLLM target fraction of total GPU memory |
+| `--habitat-worker-gib` | `1.5` | Estimated GiB per Habitat worker |
+| `--gpu-reserve-fraction` | `0.05` | Reserve fraction of total GPU memory |
+| `--max-habitat-workers` | `32` | Combined worker limit across GPUs |
+
+The starting vLLM budget of 13.3 GiB is calibrated for Qwen3-VL-4B. If a
+single worker still runs out of memory, the launcher waits for a candidate GPU
+to gain at least `--habitat-worker-gib` of free memory before retrying. Set
+`BASE_PORT` to change the first local vLLM port (default `22001`).
+
 ### Model Serving
 
 Launch a SimpleVLN checkpoint in the vLLM environment:

@@ -1,12 +1,14 @@
 """Exercise real multiprocessing orchestration with a tiny simulator substitute."""
 import ast
 from contextlib import ExitStack, nullcontext, redirect_stdout
+from copy import copy, deepcopy
 import io
+from itertools import chain
 import json
 import math
 import multiprocessing as mp
 from pathlib import Path
-from queue import Empty
+from queue import Empty, Queue
 import sys
 import tempfile
 import time
@@ -22,8 +24,6 @@ from result_store import append_result, load_result_rows, result_directory_lock
 class Dataset:
     def __init__(self, episodes):
         self.episodes = episodes
-    def get_splits(self, count, **kwargs):
-        return [Dataset(self.episodes[i::count]) for i in range(count)]
 
 
 class Environment:
@@ -59,6 +59,33 @@ class Progress:
     def __exit__(self, *args): pass
     def update(self, *args): pass
     def set_postfix(self, **kwargs): pass
+
+
+def run_mock_evaluation(dataset, result_path, *, environment=Environment, **overrides):
+    simulator = SimpleNamespace(forward_step_size=.25, turn_angle=15,
+                                habitat_sim_v0=SimpleNamespace(gpu_device_id=-1))
+    cfg = SimpleNamespace(habitat=SimpleNamespace(dataset=SimpleNamespace(type='mock'),
+                          simulator=simulator, task=SimpleNamespace(measurements={'path_length': {}})))
+    habitat = SimpleNamespace(
+        datasets=SimpleNamespace(make_dataset=lambda **kwargs: dataset),
+        config=SimpleNamespace(read_write=nullcontext),
+    )
+    ns = dict(Env=environment, SimpleVLN_Agent=Agent, time=time, ExitStack=ExitStack,
+              chain=chain, copy=copy, deepcopy=deepcopy, json=json, mp=mp.get_context('fork'), Empty=Empty,
+              np=SimpleNamespace(isfinite=math.isfinite), tqdm=Progress,
+              habitat=habitat, get_config=lambda _: cfg,
+              load_result_rows=load_result_rows, append_result=append_result)
+    tree = ast.parse((ROOT / 'vln/eval.py').read_text())
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in
+                 ('evaluate_agent', 'run_evaluation', 'evaluate_pending', 'stop_workers', 'summarize_results')]
+    exec(compile(ast.Module(body=functions, type_ignores=[]), '<eval>', 'exec'), ns)
+    args = SimpleNamespace(exp_config='mock', save_video=False, pass_k=2, split_num=64,
+                           vllm_model_name='mock', result_path=result_path,
+                           forward_distance=25, turn_angle=15, max_action_history=200,
+                           resolution_ratio=1)
+    vars(args).update(overrides)
+    with result_directory_lock(result_path), redirect_stdout(io.StringIO()):
+        ns['run_evaluation'](args, 'http://localhost:8001/v1')
 
 
 class IntegrationTests(unittest.TestCase):
@@ -99,13 +126,16 @@ class IntegrationTests(unittest.TestCase):
                       and node.name == 'evaluate_agent')
         artifacts = Mock()
         ns = dict(Env=CotEnvironment, SimpleVLN_Agent=CotAgent, time=time, ExitStack=ExitStack,
-                  EpisodeArtifacts=lambda *args: artifacts)
+                  chain=chain, copy=copy, EpisodeArtifacts=lambda *args: artifacts)
         exec(compile(ast.Module(body=[worker], type_ignores=[]), '<eval>', 'exec'), ns)
         trials = []
+        tasks = Queue()
+        tasks.put((0, (0, 1, 2)))
+        tasks.put(None)
         with tempfile.TemporaryDirectory() as path:
             ns['evaluate_agent'](SimpleNamespace(put=trials.append), 'http://localhost/v1',
                                  'mock', SimpleNamespace(habitat=None), dataset, path,
-                                 25, 15, 10, 1, True, 3, {}, policy_format='cot')
+                                 25, 15, 10, 1, True, 3, tasks, policy_format='cot')
         self.assertEqual(stepped_actions, [[], [1], [0]])
         self.assertEqual(recorded_actions, [1, 0])
         self.assertEqual([trial['success'] for trial in trials], [0, 0, 1])
@@ -128,27 +158,8 @@ class IntegrationTests(unittest.TestCase):
                                    instruction=SimpleNamespace(instruction_text='向前走' * 5000),
                                    fail=False) for i in range(2)]
         dataset = Dataset(episodes)
-        cfg = SimpleNamespace(habitat=SimpleNamespace(dataset=SimpleNamespace(type='mock'),
-                              simulator=SimpleNamespace(forward_step_size=.25, turn_angle=15),
-                              task=SimpleNamespace(measurements={'path_length': {}})))
-        habitat = SimpleNamespace(config=SimpleNamespace(read_write=lambda _: nullcontext()),
-                                  datasets=SimpleNamespace(make_dataset=lambda **_: dataset))
-        ns = dict(Env=Environment, SimpleVLN_Agent=Agent, time=time, ExitStack=ExitStack,
-                  json=json, mp=mp.get_context('fork'), Empty=Empty,
-                  np=SimpleNamespace(isfinite=math.isfinite), tqdm=Progress,
-                  habitat=habitat, get_config=lambda _: cfg,
-                  load_result_rows=load_result_rows, append_result=append_result)
-        tree = ast.parse((ROOT / 'vln/eval.py').read_text())
-        functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in
-                     ('evaluate_agent', 'run_evaluation', 'summarize_results')]
-        exec(compile(ast.Module(body=functions, type_ignores=[]), '<eval>', 'exec'), ns)
         with tempfile.TemporaryDirectory() as path:
-            args = SimpleNamespace(exp_config='mock', save_video=False, pass_k=2, split_num=64,
-                                   vllm_model_name='mock', result_path=path,
-                                   forward_distance=25, turn_angle=15, max_action_history=200,
-                                   resolution_ratio=1)
-            with result_directory_lock(path), redirect_stdout(io.StringIO()):
-                ns['run_evaluation'](args, 'http://localhost:8001/v1')
+            run_mock_evaluation(dataset, path)
             records = [json.loads(line) for line in (Path(path) / 'result.json').read_text().splitlines()]
             self.assertEqual(len(records), 5)  # 4 trials plus summary, all valid JSON
             self.assertEqual(records[-1]['pass@2'], 1)
@@ -158,12 +169,67 @@ class IntegrationTests(unittest.TestCase):
             append_result(path, {**records[0], 'trial_total': 1, 'trial_id': 0, 'success': 0})
             for ep in episodes:
                 ep.fail = True
-            with result_directory_lock(path), redirect_stdout(io.StringIO()):
-                ns['run_evaluation'](args, 'http://localhost:8001/v1')
+            run_mock_evaluation(dataset, path)
             records = [json.loads(line) for line in (Path(path) / 'result.json').read_text().splitlines()]
             self.assertEqual(len(records), 8)  # only a new summary on resume
             self.assertEqual(records[-1]['sucs_all'], 1)
             self.assertEqual(len(load_result_rows(path, pass_k=2)), 4)
+
+    @unittest.skipUnless('fork' in mp.get_all_start_methods(), 'Test uses Linux fork workers')
+    def test_fast_worker_takes_episodes_from_the_shared_queue(self):
+        ctx = mp.get_context('fork')
+        unblock_slow_episode = ctx.Event()
+        gpu_by_episode = ctx.Array('i', [-1] * 6)
+        episodes = [SimpleNamespace(scene_id='/scenes/scene/a.glb', episode_id=str(i),
+                                    instruction=SimpleNamespace(instruction_text='Go forward'),
+                                    fail=False) for i in range(6)]
+
+        class UnevenEnvironment(Environment):
+            def __init__(self, config, dataset):
+                super().__init__(config, dataset)
+                self.gpu = config.simulator.habitat_sim_v0.gpu_device_id
+
+            def reset(self):
+                index = int(self.current_episode.episode_id)
+                gpu_by_episode[index] = self.gpu
+                if index == 0 and not unblock_slow_episode.wait(timeout=10):
+                    raise RuntimeError('The other worker did not pick up the remaining episodes')
+                if index == 4:
+                    unblock_slow_episode.set()
+                return super().reset()
+
+        with tempfile.TemporaryDirectory() as path:
+            run_mock_evaluation(Dataset(episodes), path, environment=UnevenEnvironment,
+                                split_num=2, sim_gpu_ids=[2, 0], pass_k=1)
+            records = [json.loads(line) for line in (Path(path) / 'result.json').read_text().splitlines()]
+        self.assertEqual(sorted(row['episode_id'] for row in records[:-1]), list(range(6)))
+        self.assertEqual(set(gpu_by_episode), {0, 2})
+        self.assertEqual(len(set(gpu_by_episode[1:5])), 1)
+        self.assertNotEqual(gpu_by_episode[0], gpu_by_episode[1])
+
+    @unittest.skipUnless('fork' in mp.get_all_start_methods(), 'Test uses Linux fork workers')
+    def test_failed_worker_leaves_completed_trials_available_for_resume(self):
+        ctx = mp.get_context('fork')
+        resets = ctx.Value('i', 0)
+        episode = SimpleNamespace(scene_id='/scenes/scene/a.glb', episode_id='0', fail=False,
+                                  instruction=SimpleNamespace(instruction_text='Go forward'))
+
+        class FailingEnvironment(Environment):
+            def reset(self):
+                resets.value += 1
+                if resets.value == 2:
+                    raise RuntimeError('EGL_BAD_ALLOC')
+                return super().reset()
+
+        with tempfile.TemporaryDirectory() as path:
+            with self.assertRaisesRegex(RuntimeError, '1/2 results'):
+                run_mock_evaluation(Dataset([episode]), path, environment=FailingEnvironment)
+            rows = load_result_rows(path, pass_k=2)
+            self.assertEqual([key[3] for key in rows], [0])
+            self.assertEqual(len((Path(path) / 'result.json').read_text().splitlines()), 1)
+            run_mock_evaluation(Dataset([episode]), path, environment=FailingEnvironment)
+            self.assertEqual(len(load_result_rows(path, pass_k=2)), 2)
+        self.assertEqual(resets.value, 3)
 
 
 if __name__ == '__main__':

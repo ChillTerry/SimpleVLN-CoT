@@ -34,7 +34,7 @@ class EvalContractTests(unittest.TestCase):
                 self.resolve(**bad)
 
     def test_incomplete_run_cannot_produce_summary(self):
-        main = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == 'run_evaluation')
+        main = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == 'evaluate_pending')
         start = next(i for i, n in enumerate(main.body) if isinstance(n, ast.Assign)
                      and any(isinstance(t, ast.Name) and t.id == 'failed_workers' for t in n.targets))
         guard = compile(ast.Module(body=main.body[start:start + 2], type_ignores=[]), '<guard>', 'exec')

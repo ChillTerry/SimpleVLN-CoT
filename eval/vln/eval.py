@@ -3,9 +3,9 @@
 import argparse
 import base64
 from contextlib import ExitStack
-from copy import deepcopy
+from copy import copy, deepcopy
 from io import BytesIO
-from itertools import groupby
+from itertools import chain, groupby
 import json
 import multiprocessing as mp
 import os
@@ -44,11 +44,18 @@ def seed_all():
 
 def evaluate_agent(result_queue, base_url, model_name, config, dataset, result_path,
                     forward_distance, turn_angle, max_action_history, resolution_ratio,
-                    save_video, pass_k, done_rows, policy_format="legacy",
+                    save_video, pass_k, episode_queue, policy_format="legacy",
                     max_completion_tokens=None) -> None:
 
+    tasks = iter(episode_queue.get, None)
+    first_task = next(tasks, None)
+    if first_task is None:
+        return
+    initial_dataset = copy(dataset)
+    initial_dataset.episodes = [dataset.episodes[first_task[0]]]
+
     with ExitStack() as resources:
-        env = Env(config.habitat, dataset)
+        env = Env(config.habitat, initial_dataset)
         resources.callback(env.close)
         artifacts = EpisodeArtifacts(result_path, pass_k) if save_video else None
         if artifacts is not None:
@@ -65,23 +72,16 @@ def evaluate_agent(result_queue, base_url, model_name, config, dataset, result_p
             on_model_output=artifacts.record_output if artifacts is not None else None,
         )
 
-        episodes_snapshot = list(env.episodes)
-        
         EARLY_STOP_ROTATION = 25
         EARLY_STOP_STEPS = 400
 
-        for target_ep in episodes_snapshot:
-            for trial_id in range(pass_k):
+        for episode_index, trial_ids in chain((first_task,), tasks):
+            target_ep = dataset.episodes[episode_index]
+            scene_id = target_ep.scene_id.split('/')[-2]
+            episode_id = target_ep.episode_id
+            episode_instruction = target_ep.instruction.instruction_text
+            for trial_id in trial_ids:
                 episode_start_time = time.time()
-                scene_id = target_ep.scene_id.split('/')[-2]
-                episode_id = target_ep.episode_id
-                episode_instruction = target_ep.instruction.instruction_text
-                key = (scene_id, str(episode_id), episode_instruction, trial_id, pass_k)
-                if key in done_rows:
-                    result_queue.put({"t_episode": 0, "skipped": 1,
-                                      "success": float(done_rows[key]["success"])})
-                    continue
-
                 env.current_episode = target_ep
                 obs = env.reset()
                 iter_step = 0
@@ -421,7 +421,7 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--exp-config",type=str,required=True,help="path to config yaml containing info about experiment")
-    parser.add_argument("--split-num",type=int,required=True,help="number of evaluation workers")
+    parser.add_argument("--split-num", type=int, required=True, help="maximum number of evaluation workers")
     parser.add_argument("--resolution-ratio",type=float,help="scale factor for observation images, in (0, 1]",default=1.0)
     parser.add_argument("--result-path",type=str,required=True,help="location to save results")
     parser.add_argument("--forward-distance",type=int,help="distance that one forward action takes",default=25)
@@ -431,7 +431,8 @@ def main():
     parser.add_argument("--max-episodes", type=int, default=None,
                         help="evaluate only the first N episodes (use a separate result directory)")
     parser.add_argument("--sim-gpu-ids", default=None,
-                        help="comma-separated simulator GPU indices within CUDA_VISIBLE_DEVICES; workers cycle through them")
+                        help="simulator GPU index per worker within CUDA_VISIBLE_DEVICES "
+                             "(comma-separated, repeats allowed, shorter lists cycle)")
     # Accept the former no-op flag for existing launch commands; repetitions use pass-k.
     parser.add_argument("--num-generations",type=int,choices=(1,),help=argparse.SUPPRESS)
     parser.add_argument("--pass-k", type=int, default=1, help="run each trajectory k times")
@@ -460,9 +461,8 @@ def main():
             args.sim_gpu_ids = [int(value) for value in args.sim_gpu_ids.split(",")]
         except ValueError:
             parser.error("--sim-gpu-ids must contain comma-separated nonnegative integers")
-        if (not args.sim_gpu_ids or min(args.sim_gpu_ids) < 0
-                or len(set(args.sim_gpu_ids)) != len(args.sim_gpu_ids)):
-            parser.error("--sim-gpu-ids must contain distinct nonnegative integers")
+        if min(args.sim_gpu_ids) < 0:
+            parser.error("--sim-gpu-ids must contain nonnegative integers")
         visible = os.environ.get("CUDA_VISIBLE_DEVICES")
         if visible is not None and (not visible or visible == "-1"
                 or max(args.sim_gpu_ids) >= len(visible.split(","))):
@@ -505,94 +505,29 @@ def run_evaluation(args, vllm_base_url):
         raise ValueError("The configured dataset contains no episodes")
     if args.save_video and len({str(ep.episode_id) for ep in dataset.episodes}) != num_episodes:
         raise ValueError("--save-video requires unique episode IDs")
-    split_num = min(args.split_num, num_episodes)
-    dataset_splits = dataset.get_splits(split_num, allow_uneven_splits=True)
-    for ds in dataset_splits:
-        ds.config = config.habitat.dataset
-    trajectories = {
+    episode_keys = [
         (ep.scene_id.split('/')[-2], str(ep.episode_id), ep.instruction.instruction_text)
         for ep in dataset.episodes
-    }
+    ]
+    trajectories = set(episode_keys)
     if len(trajectories) != num_episodes:
         raise ValueError("Dataset contains duplicate episode/instruction identities")
     required_metrics = tuple(name for name in ("path_length", "ndtw", "sdtw")
                              if name in config.habitat.task.measurements)
     done_rows = load_result_rows(args.result_path, pass_k=args.pass_k,
                                 trajectories=trajectories, required_metrics=required_metrics)
+    pending = []
+    for index in sorted(range(num_episodes), key=lambda i: dataset.episodes[i].scene_id):
+        trial_ids = tuple(trial for trial in range(args.pass_k)
+                          if (*episode_keys[index], trial, args.pass_k) not in done_rows)
+        if trial_ids:
+            pending.append((index, trial_ids))
 
-    manager = mp.Manager()
-    result_queue = manager.Queue()
-    processes = []
-    try:
-        for i in range(split_num):
-            worker_config = config
-            sim_gpu_ids = getattr(args, "sim_gpu_ids", None)
-            if sim_gpu_ids:
-                worker_config = deepcopy(config)
-                with habitat.config.read_write(worker_config):
-                    worker_config.habitat.simulator.habitat_sim_v0.gpu_device_id = sim_gpu_ids[i % len(sim_gpu_ids)]
-            worker_args = (
-                result_queue,
-                vllm_base_url,
-                args.vllm_model_name,
-                worker_config,
-                dataset_splits[i],
-                args.result_path,
-                args.forward_distance,
-                args.turn_angle,
-                args.max_action_history,
-                args.resolution_ratio,
-                args.save_video,
-                args.pass_k,
-                done_rows,
-                getattr(args, "policy_format", "legacy"),
-                getattr(args, "max_completion_tokens", None),
-            )
-            p = mp.Process(target=evaluate_agent, args=worker_args, daemon=True)
-            p.start()
-            processes.append(p)
-
-        with tqdm(total=num_episodes * args.pass_k, desc="Evaluating") as pbar:
-            done_count = 0
-            succ_sum = 0.0
-            succ_done = 0
-            target = num_episodes * args.pass_k
-            while done_count < target:
-                alive = [p for p in processes if p.is_alive()]
-                try:
-                    result = result_queue.get(timeout=10)
-                    row = result.pop("result_row", None)
-                    if row is not None:
-                        append_result(args.result_path, row)
-                    done_count += 1
-                    if "success" in result:
-                        succ_sum += float(result["success"])
-                        succ_done += 1
-                    sr = (succ_sum / succ_done) if succ_done else 0.0
-                    pbar.update(1)
-                    pbar.set_postfix(sr=f"{sr:.4f}", **result)
-                except Empty:
-                    if not alive:
-                        print(f"All workers exited. Got {done_count}/{target} results.")
-                        break
-        
-        for p in processes:
-            p.join()
-    finally:
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-        for process in processes:
-            process.join()
-        manager.shutdown()
-
-    failed_workers = [(p.pid, p.exitcode) for p in processes if p.exitcode != 0]
-    if failed_workers or done_count != target:
-        raise RuntimeError(
-            f"Evaluation incomplete: {done_count}/{target} results; "
-            f"failed workers (pid, exitcode): {failed_workers}. "
-            "Completed episode rows are preserved for resume; no summary was written."
-        )
+    target = num_episodes * args.pass_k
+    workers = min(args.split_num, len(pending))
+    print(f"Habitat workers: {workers}", flush=True)
+    if workers:
+        evaluate_pending(args, vllm_base_url, config, dataset, pending, workers, done_rows, target)
 
     rows = load_result_rows(args.result_path, pass_k=args.pass_k,
                             trajectories=trajectories, required_metrics=required_metrics)
@@ -601,6 +536,89 @@ def run_evaluation(args, vllm_base_url):
     summary = summarize_results(rows.values(), args.pass_k)
     print(json.dumps(summary, ensure_ascii=False))
     append_result(args.result_path, summary)
+
+
+def stop_workers(processes):
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+    deadline = time.monotonic() + 5
+    for process in processes:
+        process.join(max(0, deadline - time.monotonic()))
+        if process.is_alive():
+            process.kill()
+            process.join()
+
+
+def evaluate_pending(args, vllm_base_url, config, dataset, pending, workers, done_rows, target):
+    processes = []
+    done_count = len(done_rows)
+    succ_sum = sum(float(row["success"]) for row in done_rows.values())
+    with mp.Manager() as manager:
+        episode_queue = manager.Queue()
+        result_queue = manager.Queue()
+        for task in pending:
+            episode_queue.put(task)
+        for _ in range(workers):
+            episode_queue.put(None)
+
+        try:
+            sim_gpu_ids = getattr(args, "sim_gpu_ids", None)
+            for i in range(workers):
+                worker_config = config
+                if sim_gpu_ids:
+                    worker_config = deepcopy(config)
+                    with habitat.config.read_write(worker_config):
+                        worker_config.habitat.simulator.habitat_sim_v0.gpu_device_id = sim_gpu_ids[i % len(sim_gpu_ids)]
+                worker_args = (
+                    result_queue,
+                    vllm_base_url,
+                    args.vllm_model_name,
+                    worker_config,
+                    dataset,
+                    args.result_path,
+                    args.forward_distance,
+                    args.turn_angle,
+                    args.max_action_history,
+                    args.resolution_ratio,
+                    args.save_video,
+                    args.pass_k,
+                    episode_queue,
+                    getattr(args, "policy_format", "legacy"),
+                    getattr(args, "max_completion_tokens", None),
+                )
+                process = mp.Process(target=evaluate_agent, args=worker_args, daemon=True)
+                process.start()
+                processes.append(process)
+
+            with tqdm(total=target, initial=done_count, desc="Evaluating") as pbar:
+                while True:
+                    alive = [process for process in processes if process.is_alive()]
+                    if alive and any(process.exitcode not in (None, 0) for process in processes):
+                        stop_workers(alive)
+                        alive = []
+                    # Drain results already submitted by workers even after a failure.
+                    try:
+                        result = result_queue.get(timeout=1) if alive else result_queue.get_nowait()
+                    except Empty:
+                        if not alive:
+                            break
+                        continue
+                    append_result(args.result_path, result.pop("result_row"))
+                    done_count += 1
+                    succ_sum += float(result["success"])
+                    pbar.update(1)
+                    pbar.set_postfix(sr=f"{succ_sum / done_count:.4f}", **result)
+        finally:
+            stop_workers(processes)
+
+    failed_workers = [(p.pid, p.exitcode) for p in processes if p.exitcode != 0]
+    if failed_workers or done_count != target:
+        raise RuntimeError(
+            f"Evaluation incomplete: {done_count}/{target} results; "
+            f"failed workers (pid, exitcode): {failed_workers}. "
+            "Completed episode rows are preserved for resume; no summary was written."
+        )
 
 
 def summarize_results(rows, pass_k):

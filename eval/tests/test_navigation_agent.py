@@ -7,6 +7,7 @@ from contextlib import nullcontext, redirect_stderr
 from copy import deepcopy
 from io import BytesIO, StringIO
 from itertools import groupby
+import os
 from pathlib import Path
 import re
 from types import SimpleNamespace
@@ -224,6 +225,7 @@ class CommandLineTests(unittest.TestCase):
         node = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == 'main')
         calls = []
         namespace = dict(argparse=argparse, seed_all=lambda: None,
+                         os=os,
                          resolve_vllm_urls=lambda _: 'http://server/v1',
                          result_directory_lock=lambda _: nullcontext(),
                          run_evaluation=lambda args, _: calls.append(args), print=lambda *a: None)
@@ -236,6 +238,10 @@ class CommandLineTests(unittest.TestCase):
             with patch('sys.argv', argv + [video_flag, '--num-generations', '1']):
                 namespace['main']()
             self.assertTrue(calls[-1].save_video)
+        with patch.dict(os.environ, {'CUDA_VISIBLE_DEVICES': '5,2'}), patch(
+                'sys.argv', argv + ['--split-num', '3', '--sim-gpu-ids', '0,1,0']):
+            namespace['main']()
+        self.assertEqual(calls[-1].sim_gpu_ids, [0, 1, 0])
         with patch('sys.argv', argv + ['--num-generations', '2']), redirect_stderr(StringIO()):
             with self.assertRaises(SystemExit) as error:
                 namespace['main']()
